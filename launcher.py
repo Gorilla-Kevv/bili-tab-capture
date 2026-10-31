@@ -90,14 +90,25 @@ def _request(
         conn.close()
 
 
+def _norm_path(value: Any) -> str:
+    try:
+        return os.path.normcase(str(Path(value).resolve()))
+    except (OSError, TypeError, ValueError):
+        return os.path.normcase(str(value or ""))
+
+
 def _health(port: int, timeout: float = 0.8) -> Optional[Dict[str, Any]]:
     try:
         status, data = _request(port, "GET", "/api/version", timeout=timeout)
     except Exception:
         return None
-    if status == 200 and isinstance(data, dict) and data.get("app") == APP_TAG:
-        return data
-    return None
+    if status != 200 or not isinstance(data, dict) or data.get("app") != APP_TAG:
+        return None
+    # 不同目录的副本缓存根不同，不能复用彼此的服务（否则历史/缓存会串）。
+    reported = data.get("data_dir")
+    if not reported or _norm_path(reported) != _norm_path(data_dir()):
+        return None
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -339,6 +350,118 @@ def _spawn_server(entry: Optional[Path], port: int) -> Dict[str, Any]:
     raise TimeoutError(
         f"等待服务启动超时（{START_TIMEOUT_SEC:g}s）。日志：{log_path}\n{_tail(log_path)}"
     )
+
+
+def _terminate_pid(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            return True
+        except Exception:
+            return False
+    import signal
+
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+        return True
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+
+def _status_payload(preferred_port: int) -> Dict[str, Any]:
+    info = _read_info()
+    live = None
+    if info and _health(int(info["port"])) is not None:
+        live = info
+    else:
+        live = _find_server(preferred_port)
+    if live is None:
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "app": APP_TAG,
+            "running": False,
+            "log": str(_log_path()),
+        }
+        if info:
+            payload["stale"] = {"pid": info.get("pid"), "port": info.get("port")}
+        return payload
+    port = int(live["port"])
+    return {
+        "ok": True,
+        "app": APP_TAG,
+        "running": True,
+        "pid": live.get("pid"),
+        "port": port,
+        "url": live.get("url") or f"http://127.0.0.1:{port}",
+        "version": live.get("version"),
+        "started_at": live.get("started_at"),
+        "log": str(_log_path()),
+    }
+
+
+def _stop_payload(preferred_port: int) -> Dict[str, Any]:
+    live = _live_server()
+    if live is None:
+        live = _find_server(preferred_port)
+    if live is None:
+        stale = _read_info()
+        if stale:
+            _info_path().unlink(missing_ok=True)
+        return {
+            "ok": True,
+            "app": APP_TAG,
+            "stopped": False,
+            "running": False,
+            "stale_removed": bool(stale),
+        }
+    pid = live.get("pid")
+    port = int(live["port"])
+    if not pid:
+        return {
+            "ok": False,
+            "app": APP_TAG,
+            "error": "能找到服务但缺少 pid，无法安全停止；请手动结束该进程。",
+            "port": port,
+        }
+    if not _terminate_pid(int(pid)):
+        return {
+            "ok": False,
+            "app": APP_TAG,
+            "error": "发送停止信号失败。",
+            "pid": pid,
+            "port": port,
+        }
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        if _health(port, timeout=0.5) is None:
+            break
+        time.sleep(0.2)
+    if _health(port, timeout=0.5) is not None:
+        return {
+            "ok": False,
+            "app": APP_TAG,
+            "error": "进程未在 10 秒内退出。",
+            "pid": pid,
+            "port": port,
+        }
+    _info_path().unlink(missing_ok=True)
+    _lock_path().unlink(missing_ok=True)
+    return {
+        "ok": True,
+        "app": APP_TAG,
+        "stopped": True,
+        "running": False,
+        "pid": pid,
+        "port": port,
+    }
 
 
 def _ensure_server(
@@ -588,12 +711,27 @@ def main(module, entry: Optional[Path] = None, argv: Optional[list] = None) -> i
         action="store_true",
         help="不复用已有服务，强制新开一个实例。",
     )
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument(
+        "--status", action="store_true", help="查看当前共享服务是否在运行（JSON）。"
+    )
+    actions.add_argument(
+        "--stop", action="store_true", help="停止 server.json 记录的共享服务（JSON）。"
+    )
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--info-file", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     args.bvid = [b.strip() for b in args.bvid if (b or "").strip()]
 
     no_browser = bool(args.no_browser or os.environ.get("BTAB_NO_BROWSER"))
+
+    if args.status:
+        _emit(_status_payload(args.port))
+        return 0
+    if args.stop:
+        payload = _stop_payload(args.port)
+        _emit(payload)
+        return 0 if payload.get("ok") else 1
 
     if args.serve or not args.bvid:
         try:

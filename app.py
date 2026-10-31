@@ -685,14 +685,16 @@ def run_capture_job(job_id: str, payload: Dict[str, Any]) -> None:
                     crops_dir=str(crops_dir),
                     cache_dir=str(cache_dir),
                 )
-                save_state_json(
-                    cache_dir,
-                    {
-                        "captures": captures,
-                        "capture_params": capture_params,
-                        "metadata": metadata_to_dict(metadata),
-                    },
-                )
+                # 只替换 captures 相关字段，保留 params2/layout 等既有进度——
+                # 整份覆盖会把用户在第 2/4 步调过的参数全部丢掉。
+                state = load_state_json(cache_dir) or {}
+                state["captures"] = captures
+                state["capture_params"] = capture_params
+                state["metadata"] = metadata_to_dict(metadata)
+                # 新截图集对应的卡片从默认值重建（旧 images 可能指向已删除的文件）。
+                state["images"] = restore_images({"captures": captures})
+                state["maxStage"] = max(3, int(state.get("maxStage") or 0))
+                save_state_json(cache_dir, state)
             print(f"已生成 {len(captures)} 张截图。")
         except Exception as exc:
             update_job(
@@ -849,8 +851,13 @@ def index():
 
 @app.get("/api/version")
 def api_version():
-    # app 标识用于启动器识别“这个端口上是不是 BiliTabCapture”（端口可能被别的程序占着）。
-    return jsonify({"app": "BiliTabCapture", "version": APP_VERSION})
+    # app + data_dir 标识用于启动器识别“这个端口上是不是同一份 BiliTabCapture”：
+    # 端口可能被别的程序占着；不同目录的副本（源码/exe）缓存根不同，不能互相复用。
+    return jsonify({
+        "app": "BiliTabCapture",
+        "version": APP_VERSION,
+        "data_dir": str(ROOT_DIR),
+    })
 
 
 SKIPPED_VERSION_FILE = CACHE_DIR / "skipped_version.txt"
@@ -913,10 +920,47 @@ def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) 
                     src["download"] = {"status": "error", "message": str(exc)}
 
 
+def cached_job_video_path(source_id: str, cache_dir: Path) -> Optional[Path]:
+    """缓存恢复出来的 job 也要能“补插截图”，所以需要找回成品视频文件。"""
+    with STORE_LOCK:
+        source = SOURCES.get(source_id) or {}
+    if source.get("type") == "bilibili":
+        found = cached_bilibili_video(cache_dir, cache_dir.name)
+    else:
+        found = find_video_file(cache_dir)
+    if found is not None:
+        return found
+    raw = source.get("video_path")
+    return Path(raw) if raw else None
+
+
+def find_cached_job_id(source_id: str, cache_dir: Path) -> Optional[str]:
+    """复用同一 source/cache 下已有的 done job，避免每次读取 source 都新建 job。"""
+    try:
+        target = str(cache_dir.resolve())
+    except OSError:
+        target = str(cache_dir)
+    with STORE_LOCK:
+        for job_id, job in JOBS.items():
+            raw = job.get("cache_dir")
+            if not raw or job.get("source_id") != source_id:
+                continue
+            if job.get("status") != "done" or not job.get("captures"):
+                continue
+            try:
+                same = str(Path(raw).resolve()) == target
+            except OSError:
+                same = str(raw) == target
+            if same:
+                return job_id
+    return None
+
+
 def make_cached_job(source_id: str, cache_dir: Path, state: Dict[str, Any]) -> str:
     """Create a done job from persisted cache state; returns the job_id."""
     job_id = uuid.uuid4().hex
     captures = state.get("captures") or []
+    video = cached_job_video_path(source_id, cache_dir)
     with STORE_LOCK:
         JOBS[job_id] = {
             "id": job_id,
@@ -932,6 +976,7 @@ def make_cached_job(source_id: str, cache_dir: Path, state: Dict[str, Any]) -> s
             "crops_dir": str(cache_dir / "crops"),
             "cache_dir": str(cache_dir),
             "capture_params": state.get("capture_params") or {},
+            "video_path": str(video) if video is not None else None,
             "created_at": time.time(),
             "updated_at": time.time(),
         }
@@ -2615,12 +2660,42 @@ def source_image(source_id: str):
 
 @app.get("/api/source/<source_id>")
 def source_instance(source_id: str):
-    """按 source_id 取回完整 source（启动器用 `?source=<id>` 让页面接手导入结果）。"""
+    """按 source_id 取回完整 source（启动器用 `?source=<id>` 让页面接手导入结果）。
+
+    如果该 source 已经有截图态，额外带上 `restore`：这样刷新页面不会退回第 2 步
+    丢掉卡片；前端仍会弹“恢复进度/从新开始”的询问。
+    """
     with STORE_LOCK:
         source = SOURCES.get(source_id)
     if source is None:
         return json_error("未知的视频源。", 404)
-    return jsonify(source)
+
+    result = dict(source)
+    cache_dir_str = result.get("cache_dir")
+    if cache_dir_str:
+        cache_dir = Path(cache_dir_str)
+        state = load_state_json(cache_dir)
+        if state:
+            result["params2"] = read_capture_prefs(state)
+            if _has_images(cache_dir, state):
+                job_id = find_cached_job_id(source_id, cache_dir)
+                if job_id is None:
+                    job_id = make_cached_job(source_id, cache_dir, state)
+                meta = state.get("metadata") or result.get("metadata") or {}
+                result["has_cache"] = True
+                result["cache"] = {
+                    "cache_dir": str(cache_dir),
+                    "type": result.get("type"),
+                    "key": cache_dir.name,
+                    "title": meta.get("display_title") or meta.get("raw_title"),
+                }
+                result["restore"] = {
+                    "job_id": job_id,
+                    "images": restore_images(state),
+                    "layout": state.get("layout"),
+                    "maxStage": state.get("maxStage"),
+                }
+    return jsonify(result)
 
 
 @app.get("/api/source_info/<source_id>")

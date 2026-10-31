@@ -60,11 +60,17 @@ python app.py
 
 ```bash
 python app.py --bvid BV1xx411c7mD
+
+# 查看 / 停止后台服务
+python app.py --status
+python app.py --stop
 ```
 
 - 会先复用已经运行的本地服务；没有就在后台拉起一个（端口与 pid 记录在 `BiliTabCapture_cache/server.json`）。
 - 自动导入指定 BV，并在浏览器打开对应页面；后续裁剪、排版、导出仍在网页里手动完成。
+- 页面地址带 `?source=`，刷新/浏览器重启后可恢复；已有截图时会提示“恢复进度”。
 - 支持多个 `--bvid`；`--wait 300` 可等待视频下载完成后再退出；`--new-instance` 强制新开一个服务。
+- `--status` 查看服务状态，`--stop` 停止服务（页面会断开，缓存保留）。
 - 打包后的 `BiliTabCapture.exe` 使用相同参数（需要重新打包才会包含该功能）。
 
 ## 打包

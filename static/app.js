@@ -829,12 +829,21 @@ function resetExtractionState() {
 
 let pendingCacheSource = null; // 已命中缓存但等待用户“恢复/清除”决定的源
 
+// 把当前 source 同步到地址栏，刷新/浏览器重启后还能按同一个 source 恢复。
+function syncSourceInUrl(sourceId) {
+  const url = new URL(location.href);
+  if (sourceId) url.searchParams.set("source", sourceId);
+  else url.searchParams.delete("source");
+  history.replaceState(null, "", url.pathname + (url.search || "") + url.hash);
+}
+
 function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   // 命中缓存且尚未做“恢复/清除”决定时，先弹窗询问，等用户选择后再继续。
   if (!mode && source.has_cache && source.cache) {
     openCachePrompt(source);
     return;
   }
+  if (source && source.id) syncSourceInUrl(source.id);
 
   state.previewRequestId += 1;
   state.previewTime = null;
@@ -1039,6 +1048,7 @@ async function clearPendingCache() {
       state.captureJobId = null;
       persistSnapshot = null;
       state.maxStage = 1;
+      syncSourceInUrl(null);
       setStage(1);
       resetExtractionState();
       setStatus(els.importStatus, "已清空该内容缓存；请重新选择文件导入。", "warning");

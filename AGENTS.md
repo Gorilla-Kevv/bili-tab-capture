@@ -62,7 +62,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 3. **登录态可能触发防盗链 404**：个别视频带登录 cookie 请求高清直链会 404/403，游客反而可用。下载逻辑需保留「先登录→失败退游客」的重试与逐档降清晰度。
 4. **`.m4s` 是一等公民**：新增/修改“视频文件”识别时，务必把 `.m4s` 一并纳入（`tab_extractor.VIDEO_FILE_EXTENSIONS`、`app.ALLOWED_VIDEO_EXTENSIONS`、历史记录 `_playable`、前端 `accept` 与 `isImportableFile`）。漏掉会导致历史记录灰显、导入提示不支持。**反向也有一条**：`find_video_file()` 是按扩展名 glob 整个目录的，所以缓存目录里的音轨只能叫 `audio.m4a`（`AUDIO_FILE_EXTENSIONS` 一个都不能落进 `VIDEO_FILE_EXTENSIONS`）——改名成 `audio.m4s` / `audio.mp4` 就会被当成视频挑走（新下的音频 mtime 更新，必中），抽帧直接报错。
 5. **历史记录 = 直接遍历缓存目录**：目的是“管理本地存储占用”，**不能用 `state.json` 是否存在来筛选**——只下载未截图的目录也要列出（标题缺失时回退为 key）。恢复时：有截图态→复原卡片/排版；无截图态→进入第 2 步并回填 `params2`。
-6. **第 2 步参数提前持久化**：截图参数（起止时间、采样间隔、差异阈值、条带半宽、比较窗口、去色容差/平滑、抽帧前裁剪框 `crop*`）通过 `POST /api/save_capture_prefs` 存进 `state.json` 的 `params2`（改动即存、防抖）。读取时 `read_capture_prefs()` 会为缺失字段**回退默认值以兼容旧版缓存**。
+6. **第 2 步参数提前持久化**：截图参数（起止时间、采样间隔、差异阈值、条带半宽、比较窗口、去色容差/平滑、抽帧前裁剪框 `crop*`）通过 `POST /api/save_capture_prefs` 存进 `state.json` 的 `params2`（改动即存、防抖）。读取时 `read_capture_prefs()` 会为缺失字段**回退默认值以兼容旧版缓存**。**视频截图完成写 state 时只替换 `captures/capture_params/metadata/images`，必须保留 `params2/layout`**——整份覆盖会丢掉第 2/4 步设置（已修）。
 7. **“从新开始”（命中弹窗）会删除整个缓存目录**（`/api/cache_clear` + `full:true`）：之后必须避免继续引用已删除的文件（B 站会重新导入下载，本地/图片则回到第 1 步让用户重选）。
 8. **中文标题字体**：PDF/长图的标题渲染依赖跨平台 CJK 字体查找（`tab_extractor.load_font`）。修改字体逻辑要保证 macOS（Hiragino/Songti/STHeiti）与 Windows（msyh 等）都能命中，否则中文会变“豆腐块”。
 9. **端口被占自动顺延**：启动逻辑已移到 `launcher.py`：5000 被占（macOS AirPlay / 另一个实例）时按 5001、5002… 顺延，`--port 0` 交给系统分配；`BTAB_NO_BROWSER=1` 可禁止自动开浏览器。
@@ -92,17 +92,18 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
     - **412 ≠ 区域限制**：番剧/版权视频被墙返回的是 `-10403 您所在地区不可观看`（或 404），那只能挂代理，改代码没用。
     - `curl_cffi` 的 session 默认 `trust_env=True`，会读 `http_proxy` / `https_proxy` 环境变量；原来那两处 urllib 是显式跳过系统代理的，环境变量代理的机器上行为会有这点差异。
 20. **agent 快捷启动（`--bvid`）**：`app.py` 的 `__main__` 现在只负责委托给 `launcher.main()`。`--bvid` **不是在前台起服务**：
-    - 先读 `BiliTabCapture_cache/server.json`，`GET /api/version` 返回 `app: "BiliTabCapture"` 就复用；否则只快速探测 5000–5002，仍没有才 detached 拉起 `--serve`（用唯一 `--info-file` 回传实际端口，避免与 canonical 文件抢写）。
+    - 先读 `BiliTabCapture_cache/server.json`，`GET /api/version` 返回 `app: "BiliTabCapture"` **且 `data_dir` 与本副本一致**才复用；否则只快速探测 5000–5002，仍没有才 detached 拉起 `--serve`（用唯一 `--info-file` 回传实际端口，避免与 canonical 文件抢写）。**不同目录的源码/exe 副本缓存根不同，必须各自用各自的服务**，不能按端口互相复用。
     - 发现/拉起用 `BiliTabCapture_cache/launcher.lock` 串行化，多个 agent 并发调用只会起一个服务；不同 BV 的导入/下载在同一个服务里并行。
-    - 导入在服务端完成（`POST /api/import`，form 字段 `bvid`），随后打开 `/?source=<source_id>`；前端 `openSourceFromQuery()` 调 `GET /api/source/<id>` 后 `applySource()`。**`source` 参数故意保留在 URL 上**，刷新/浏览器重启后还能恢复同一个源。
+    - 导入在服务端完成（`POST /api/import`，form 字段 `bvid`），随后打开 `/?source=<source_id>`；前端 `openSourceFromQuery()` 调 `GET /api/source/<id>` 后 `applySource()`。**`source` 参数故意保留在 URL 上**，刷新/浏览器重启后还能恢复同一个源。该接口在源已有截图态时会附带 `restore`（复用/创建 cached job），刷新后会弹“恢复进度”，**不会退回第 2 步丢卡片**。
     - stdout 只输出 JSON（`ensure_ascii=True`，避免 Windows GBK 把中文变成乱码）；退出码 0=全部成功、1=有 BV 导入失败。`--wait N` 会先把所有 BV 导入完，再统一等下载。日志在 `BiliTabCapture_cache/launcher-server.log`。
-    - **服务是 detached 的**（没有窗口可关）：要停就结束 `server.json` 里的 `pid`；删 `server.json` 停不了服务（默认端口段内的实例下次仍会被探测复用）。没有 `app` 标识的旧版服务不会被复用。
+    - **服务是 detached 的**（没有窗口可关）：用 `--status` 查看、`--stop` 停止（会清理 `server.json`/`launcher.lock`）；也可以手动结束 `server.json` 里的 `pid`。删 `server.json` 停不了服务（默认端口段内的实例下次仍会被探测复用）。没有 `app` + 相同 `data_dir` 标识的旧版/其他副本服务不会被复用。
     - 打包脚本已加 `--hidden-import launcher`；**改完必须重新打包**，旧 exe 不认 `--bvid`。
 21. **并发相关的几个硬点**：
     - **端口必须独占**：Windows 的 `SO_REUSEADDR` 允许两个进程同时监听同一端口（实测两个实例都能 bind 5000，请求随机落到其中一个）。`launcher.serve()` 用 `allow_reuse_address = False` 的 `ThreadedWSGIServer` 子类；werkzeug bind 失败走的是 `sys.exit(1)`，必须接住 `SystemExit` 才能继续试下一个端口。**不要改回 `app.run` / `make_server` 的默认值**。
     - **启动前不要全端口段扫描**：`serve()` 里曾为“判断是否还有别的实例”而探测 5000–5029，遇到不响应的端口会让首个服务 30 秒才就绪；等待方把**活锁**当过期，结果重复起了两个服务（实测复现）。现在只探测 canonical + 5000–5002，且 `_LaunchLock` 会检查锁文件里的 owner pid（活着就不抢，死了立即回收），不再只靠 mtime。
     - **B 站请求线程隔离**：`bili.py` 用 `threading.local()` 的 `_get_session()`；**不要再引入模块级共享 `Session`**（多标签并发导入/下载会共用同一个 curl handle）。Cookie 仍然逐请求显式传。
     - **同一个 BV 只下载一次**：`bilibili_download_lock()` 按缓存目录串行化；`cached_bilibili_video()` 只认下载完成后重命名的 `BVxxx.*`，**不要把下载中的 `video.m4s` / `video.mp4` 当缓存**（并发导入会误判“已下好”）。新增下载命名方式时两处都要同步。
+    - **缓存恢复的 job 必须带 `video_path`**：`make_cached_job()` 通过 `cached_job_video_path()` 找回成品视频，否则从历史/刷新恢复后“补插截图”会 409。
     - 另外：`launcher.serve()` 在启动清理前会探测是否已有实例在跑，有就跳过 `cleanup_orphan_transient()`，否则会删掉别的实例的 `runs/`、`previews/`。
 
 ## 常用命令
@@ -117,7 +118,11 @@ python -m venv .venv
 .venv/bin/python app.py --bvid BV1xx411c7mD
 .venv/bin/python app.py --bvid BV1... --bvid BV2... --wait 300
 
-# 常驻服务是 detached 的，停止请结束 BiliTabCapture_cache/server.json 里的 pid
+# 查看/停止常驻服务
+.venv/bin/python app.py --status
+.venv/bin/python app.py --stop
+
+# 常驻服务是 detached 的；也可以手动结束 server.json 里的 pid
 # （Windows: Stop-Process -Id <pid>）
 
 # 仅当参数解析/抽帧算法改动时，用 CLI 快速验证

@@ -26,14 +26,15 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 | 文件 | 职责 |
 | --- | --- |
 | `app.py` | Flask 服务与全部 HTTP 路由；任务(Job)/源(Source)内存管理；缓存与历史记录；PDF/长图/psz 导出。 |
-| `launcher.py` | **启动/并发入口**：`--bvid` 快捷启动（发现/复用常驻服务，或 detached 拉起一个；经 HTTP 调 `/api/import`，再打开 `/?source=<id>`，最后输出 JSON）；`--serve` 是真正的前台服务实现（独占端口、写 `server.json`、并发锁）。 |
+| `launcher.py` | **启动/并发入口**：`--bvid` 快捷启动（发现/复用常驻服务，或 detached 拉起一个；经 HTTP 调 `/api/import`，再打开 `/?source=<id>`，最后输出 JSON）；`--serve` 是真正的前台服务实现（独占端口、写 `server.json`/`servers/` 注册表、并发锁）。 |
+| `mcp_server.py` | **MCP (stdio) 入口**：用官方 `mcp>=2.0` SDK 暴露 status/import/capture/小节线/自动裁剪/导出/历史等工具；作为共享服务的 HTTP 客户端，按需复用或拉起服务。**依赖在 `requirements-mcp.txt`，不进核心 requirements。** |
 | `tab_extractor.py` | 视频抽帧、去重、裁剪、小节线识别、长图/PDF 绘制；**同时也可作为独立 CLI** (`python tab_extractor.py <url/文件>`)。`build_pdf_from_images` 的 `geometry` 出参与 `build_score_meta` 负责 psz 的排版几何 → `score.json`。 |
 | `bili.py` | 哔哩哔哩扫码登录(二维码)与视频下载。**所有平台统一走这里**，不使用 `bilix.exe`/yt-dlp。同时是**所有 B 站 HTTP 请求的唯一出口**：`bili_get()` / `get_json()` / `resolve_short_url()`（curl_cffi 浏览器指纹 + 主页热身 + 412 降级，见「关键约定」第 19 条）。 |
 | `pdf_render.py` | **PDF 渲染**：`render_pdf_pages` 批量逐页渲染、`render_pdf_page` 单页渲染、`pdf_page_count` 探页数、`clamp_dpi` 收敛 DPI（50–600，默认 200）。依赖 PyMuPDF，**延迟导入**——缺依赖时只有真正导入 PDF 才报错，视频/图片不受影响。 |
 | `runtime_paths.py` | 打包(PyInstaller)与源码运行时的路径解析：`resource_dir()`(只读资源)/`data_dir()`(可写数据, cookie/缓存)。 |
 | `static/app.js` | 前端全部逻辑（导入、预览、裁剪、小节线、排版、上传、历史记录、更新检查、复位图标等）。 |
 | `static/icons/*.svg` | 工具栏/按钮图标，均为独立 SVG 文件，**直接改文件即可替换图形**（`loadIcons()` 读取）。 |
-| `tests/test_core.py` | 无头回归测试：状态保留、刷新恢复、补插、重置/删除缓存、PDF 页数、运行中任务、同 BV 下载锁。用 `python -m unittest discover -s tests -v` 运行，全部使用临时缓存。 |
+| `tests/test_core.py` / `tests/test_mcp.py` | 无头回归：状态保留、刷新恢复、补插、重置/删除缓存、PDF 页数、运行中任务、同 BV 下载锁；外加官方 MCP Client 的 stdio 冒烟测试（缺 `mcp` 时自动跳过）。用 `python -m unittest discover -s tests -v` 运行，全部使用临时缓存。 |
 | `build_exe.bat` / `build_mac.sh` | 一键打包（免环境运行）。产物写入 `dist/`。 |
 | `VERSION` | 版本号，渲染进页面；更新检查用它比较。 |
 
@@ -112,6 +113,12 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
     - **实例注册表**：每个 `serve` 在 `cache/servers/<port>-<pid>.json` 写一份；`--status` / `--stop` / `--stop-all` 以它为准，即使 `server.json` 丢失/被覆盖也能找到随机端口实例。停止优先 `POST /api/shutdown`（自定义头 `X-BiliTabCapture: 1`，失败再按 pid 强杀）；`data_dir` 不匹配的其他副本实例不会被误停。
     - 另外：`launcher.serve()` 在启动清理前会探测是否已有实例在跑，有就跳过 `cleanup_orphan_transient()`，否则会删掉别的实例的 `runs/`、`previews/`。
 
+22. **MCP Server（stdio）**：`mcp_server.py` 使用**官方 `mcp>=2.0` SDK**（v2 已把 `FastMCP` 改名为 `MCPServer`，导入路径 `mcp.server.mcpserver`）。它是共享服务的 HTTP 客户端：导入/截图前用 `launcher.ensure_server()` 复用或拉起服务，其余全部走现有 API。
+    - **stdout 是 MCP 协议，工具函数里绝不能 `print`**；需要日志只用 stderr / `launcher-server.log`。
+    - 导出优先读 `GET /api/source/<id>` 的 `restore.images/layout`；`serializeLayout()` 已额外持久化 `binarize/noteColor/tolerance/softness`，让 MCP 能复现第 4 步的去色/反色。没有 restore 时才用 job captures 的默认裁剪。
+    - 工具：`status` / `stop_server` / `import_bvid` / `open_tab` / `get_source` / `capture` / `get_job` / `detect_measures` / `auto_crop` / `export_score` / `history`。默认不自动打开浏览器（`open_browser=True` 才开）。
+    - 依赖是**可选的** `requirements-mcp.txt`（`-r requirements.txt` + `mcp>=2.0`）；不要加进核心 `requirements.txt`，也**尚未打进 exe**（MCP 入口目前走源码/venv）。
+
 ## 常用命令
 
 ```bash
@@ -140,11 +147,15 @@ build_exe.bat        # Windows → dist/BiliTabCapture.exe
 bash build_mac.sh    # macOS   → dist/BiliTabCapture_mac
 
 # 语法自检（无需运行 GUI）
-.venv/bin/python -m py_compile app.py launcher.py tab_extractor.py bili.py runtime_paths.py pdf_render.py
+.venv/bin/python -m py_compile app.py launcher.py mcp_server.py tab_extractor.py bili.py runtime_paths.py pdf_render.py
 node --check static/app.js
 
 # 无头回归测试（临时缓存，不碰真实 BiliTabCapture_cache/）
 .venv/bin/python -m unittest discover -s tests -v
+
+# MCP（stdio；通常由 MCP 客户端按 command/args 启动，不手动跑）
+.venv/bin/pip install -r requirements-mcp.txt
+.venv/bin/python mcp_server.py
 
 # 造一个多页测试 PDF（不需要任何外部工具）
 .venv/bin/python -c "
@@ -158,7 +169,7 @@ ps[0].save('/tmp/t.pdf', save_all=True, append_images=ps[1:])"
 - 改后端路由/任务：先读 `app.py` 里相近的路由与 `JOBS/SOURCES` 的用法，保持异常都返回 `json_error(...)`。
 - 改前端：`static/app.js` 顶部有 `els`（DOM 引用）与 `els` 之外的 `state`；新增 UI 记得在 `index.html` 加元素、在 `els` 注册，样式追加到 `styles.css` 末尾并复用主题变量（`--accent` / `--accent-weak` / `--accent-strong` / `--line` / `--input-bg` / `--muted` 等）。
 - 图标：优先放 `static/icons/<name>.svg` 并在 `loadIcons()` 的映射中登记，不要在 JS 里内联大段 SVG（除非占位回退）。
-- 依赖：保持精简（现为 Flask / numpy / opencv-python / Pillow / curl_cffi / qrcode / **pymupdf**）。**不要引入 ffmpeg 或新的重型依赖**，除非明确讨论过。
+- 依赖：保持精简（现为 Flask / numpy / opencv-python / Pillow / curl_cffi / qrcode / **pymupdf**）。**不要引入 ffmpeg 或新的重型依赖**，除非明确讨论过。MCP 的 `mcp` SDK 是**可选依赖**，只放 `requirements-mcp.txt`，不要加进核心 requirements 或默认打包。
 - **启动/并发改动**：`app.py` 的 `__main__` 只委托 `launcher.main()`；新增启动参数放 `launcher.main()` 的 argparse，不要再恢复 `app.py` 里旧的 `_port_free` / `app.run` 逻辑。前端 `?source=` 参数要保留（刷新恢复依赖它）。
 - **无头验证后端**：Flask 自带 `app.test_client()` 就能把整条链路跑通（导入→预览→生成截图→导出 PDF），不必开浏览器。记得 `BTAB_NO_BROWSER=1`，跑完清掉 `BiliTabCapture_cache/` 里的测试残留。
 
@@ -170,6 +181,7 @@ ps[0].save('/tmp/t.pdf', save_all=True, append_images=ps[1:])"
 - 涉及 PDF：确认导入能拿到页数、改 DPI 会整体重渲、页码区间能正确产出对应页数的卡片。
 - 涉及 psz：`POST /api/psz` 后把包读回来，确认条目**都在根目录** —— 多一个子目录就会在 PDF Score 那边变成两张乐谱；再对一遍四条分支：有小节线→`score.json` 带 `pages`；每行一个小节且无音频→**没有** `score.json`；每行一个小节但有音频→`score.json` 在且 `pages` 为空数组。带 `score.json` 且 `pages` 非空时，还要确认 `pages` 的张数、页面尺寸与 PDF 实际的页数、MediaBox 一致（PDF Score 会拿 PDF 的真实值覆盖它们）。
 - 涉及启动器/并发：确认无服务时能 detached 拉起、有服务时返回 `reused: true`、两个启动器并发只起一个服务；端口被占能顺延到 5001；`?source=` 页面能进第 2 步且刷新后仍能恢复；同一个 BV 并发导入只下载一次（可 mock `download_bilibili_video` 验证调用次数）。
+- 涉及 MCP：用官方 Client 走 stdio 跑 `tests/test_mcp.py`（`list_tools` + `status`）；改导出逻辑后实际调一次 `export_score`，用 PyMuPDF 校验输出 PDF 页数。
 - 涉及刷新恢复：已完成的截图刷新后能恢复卡片；运行中的任务刷新后能继续轮询并完成；重置进度保留 master/视频，删除缓存才移除原文件。
 - 涉及多实例：`--status` 能列出 `servers/` 注册表里的实例，`--stop-all` 能清理默认端口与随机端口实例，且不会误停其他副本（data_dir 不同）。
 - 涉及打包：重新执行 `build_exe.bat` / `build_mac.sh` 后，至少确认 `--bvid` 可用；未重新打包要明确说明“旧 exe 不包含该功能”。

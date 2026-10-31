@@ -34,6 +34,7 @@
 - 缓存恢复支持“恢复进度 / 重置进度 / 删除缓存”
 - 页面刷新后可恢复已完成的截图，也会继续等待正在生成的任务
 - 支持命令行按 BV 自动导入（供 agent / 脚本批量派发）
+- 提供 MCP Server（stdio），供本地 agent / 工具调用
 
 ## 声明
 
@@ -75,6 +76,39 @@ python app.py --stop-all
 - 支持多个 `--bvid`；`--wait 300` 可等待视频下载完成后再退出；`--new-instance` 强制新开一个服务。
 - `--status` 查看服务状态，`--stop` 停止服务（页面会断开，缓存保留）。
 - 打包后的 `BiliTabCapture.exe` 使用相同参数（需要重新打包才会包含该功能）。
+
+## MCP（给本地 agent / 工具）
+
+MCP 是可选入口，依赖单独安装：
+
+```bash
+pip install -r requirements-mcp.txt
+```
+
+通常由 MCP 客户端以 stdio 启动 `mcp_server.py`。客户端配置示例：
+
+```json
+{
+  "mcpServers": {
+    "bili-tab-capture": {
+      "command": "F:/path/to/.venv/Scripts/python.exe",
+      "args": ["F:/path/to/mcp_server.py"]
+    }
+  }
+}
+```
+
+macOS 把 command 换成 `.venv/bin/python`。
+
+可用工具：
+
+- `import_bvid`：导入 BV/av/链接，可等待下载完成
+- `get_source` / `capture` / `get_job`：查看源、生成截图、查询任务
+- `detect_measures` / `auto_crop`：小节线/自动裁剪，可写回 state
+- `export_score`：导出 PDF / psz / 长图，默认使用已保存的裁剪和排版；`output` 建议传绝对路径
+- `open_tab` / `status` / `stop_server` / `history`：打开页面、服务状态、停止、历史记录
+
+MCP 会复用本地常驻服务，没有时自动拉起；默认不打开浏览器。当前 MCP 入口走源码/venv，尚未内置到打包 exe。
 
 ## 测试
 

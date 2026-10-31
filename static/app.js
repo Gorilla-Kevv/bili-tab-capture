@@ -426,6 +426,11 @@ function serializeLayout() {
     previewCols: currentPreviewCols(),
     invert: !!els.invertInput.checked,
     recolor: !!(els.recolorInput && els.recolorInput.checked),
+    // 供 MCP/其他工具按 state 复现导出；GUI 自己的导出仍读实时控件。
+    binarize: !!(state.noteColorSelected && els.recolorInput && els.recolorInput.checked),
+    noteColor: (els.noteColor && els.noteColor.value) || "#000000",
+    tolerance: numericValue(els.tolerance, 300),
+    softness: numericValue(els.softness, 90),
   };
 }
 

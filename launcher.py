@@ -77,10 +77,14 @@ def _request(
     form: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
     headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, Any]:
     body = None
     hdrs: Dict[str, str] = dict(headers or {})
-    if form is not None:
+    if json_body is not None:
+        body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    elif form is not None:
         body = urllib.parse.urlencode(form).encode("utf-8")
         hdrs["Content-Type"] = "application/x-www-form-urlencoded"
     conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
@@ -598,6 +602,38 @@ def _ensure_server(
                 return int(info["port"]), True, info
         info = _spawn_server(entry, preferred_port)
         return int(info["port"]), False, info
+
+
+# --------------------------------------------------------------------------
+# 给 MCP/其他本地工具用的公开入口
+# --------------------------------------------------------------------------
+
+def ensure_server(
+    entry: Optional[Path] = None,
+    preferred_port: int = DEFAULT_PORT,
+    force_new: bool = False,
+) -> Tuple[int, bool, Dict[str, Any]]:
+    return _ensure_server(entry, preferred_port, force_new)
+
+
+def existing_server(preferred_port: int = DEFAULT_PORT) -> Optional[Dict[str, Any]]:
+    return _live_server() or _find_server(preferred_port)
+
+
+def status_payload(preferred_port: int = DEFAULT_PORT) -> Dict[str, Any]:
+    return _status_payload(preferred_port)
+
+
+def stop_payload(preferred_port: int = DEFAULT_PORT, stop_all: bool = False) -> Dict[str, Any]:
+    return _stop_payload(preferred_port, stop_all=stop_all)
+
+
+def api_request(port: int, method: str, path: str, **kwargs) -> Tuple[int, Any]:
+    return _request(port, method, path, **kwargs)
+
+
+def open_browser(url: str) -> bool:
+    return _open_browser(url)
 
 
 # --------------------------------------------------------------------------

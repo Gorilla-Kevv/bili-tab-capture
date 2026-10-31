@@ -62,6 +62,7 @@ const els = {
   cacheModalClose: document.getElementById("cacheModalClose"),
   cacheModalDesc: document.getElementById("cacheModalDesc"),
   cacheModalRestore: document.getElementById("cacheModalRestore"),
+  cacheModalReset: document.getElementById("cacheModalReset"),
   cacheModalClear: document.getElementById("cacheModalClear"),
   previewFrame: document.getElementById("previewFrame"),
   timeline: document.getElementById("timeline"),
@@ -837,9 +838,30 @@ function syncSourceInUrl(sourceId) {
   history.replaceState(null, "", url.pathname + (url.search || "") + url.hash);
 }
 
+// 刷新时如果后台还有生成任务，回到“生成中”并继续轮询，完成后再渲染卡片。
+function resumeActiveJob(job) {
+  if (!job || !job.job_id) return;
+  state.captureJobId = job.job_id;
+  state.maxStage = 1;
+  setStage(1);
+  setStatus(els.extractStatus, "正在恢复上次的生成任务…");
+  setExtractProgress(null, "恢复任务…");
+  els.generateButton.disabled = true;
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  pollJob(job.job_id).then((first) => {
+    if (first && !["done", "error"].includes(first.status)) {
+      state.pollTimer = setInterval(() => pollJob(job.job_id), 1000);
+    }
+  });
+}
+
 function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   // 命中缓存且尚未做“恢复/清除”决定时，先弹窗询问，等用户选择后再继续。
-  if (!mode && source.has_cache && source.cache) {
+  // 但如果后台还有正在跑的任务，优先恢复任务（它完成后会写到新的 state）。
+  if (!mode && source.has_cache && source.cache && !source.active_job) {
     openCachePrompt(source);
     return;
   }
@@ -935,6 +957,11 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   updateCropUi();
   updateTimeline();
 
+  if (source.active_job) {
+    resumeActiveJob(source.active_job);
+    return;
+  }
+
   // 用户选择“恢复进度”：恢复截图、调整状态与排版参数；若已保存过排版则直接跳到第四步。
   if (mode === "restore" && source.restore) {
     state.captureJobId = source.restore.job_id;
@@ -986,6 +1013,47 @@ async function resumePendingCache() {
   applySource(source, "restore");
 }
 
+function setCacheButtonsBusy(busy) {
+  [els.cacheModalRestore, els.cacheModalReset, els.cacheModalClear].forEach((button) => {
+    if (button) button.disabled = busy;
+  });
+}
+
+/**
+ * 重置进度：清空截图/裁剪参数，但保留下载的视频、master 图片/PDF。
+ * 清完后用 /api/history/restore 从缓存重建 source，回到第 2 步，不需要重新选择文件。
+ */
+async function resetPendingCache() {
+  const source = pendingCacheSource;
+  if (!source) return;
+  const cache = source.cache || {};
+  if (!cache.type || !cache.key) {
+    setStatus(els.importStatus, "缺少缓存信息，无法重置。", "error");
+    return;
+  }
+  els.cacheModalDesc.textContent = "正在重置进度…";
+  setCacheButtonsBusy(true);
+  try {
+    await fetchJson("/api/cache_clear", {
+      method: "POST",
+      body: JSON.stringify({ type: cache.type, key: cache.key, full: false }),
+    });
+    const next = await fetchJson("/api/history/restore", {
+      method: "POST",
+      body: JSON.stringify({ kind: cache.type, key: cache.key }),
+    });
+    pendingCacheSource = null;
+    els.cacheModal.classList.add("hidden");
+    applySource(next, "fresh");
+    setStatus(els.importStatus, "已重置进度，原始文件仍保留。", "success");
+  } catch (error) {
+    els.cacheModalDesc.textContent = cache.title || cache.key || "已导入过的内容";
+    setStatus(els.importStatus, error.message || "重置进度失败。", "error");
+  } finally {
+    setCacheButtonsBusy(false);
+  }
+}
+
 /**
  * 缓存已彻底清空后，用「重新 import」把同一个源重新建起来。
  * 与 B 站分支原本的做法一致，本地文件也复用同一条路：
@@ -1011,10 +1079,11 @@ async function reimportClearedSource(cache) {
 
 async function clearPendingCache() {
   const source = pendingCacheSource;
+  if (!source) return;
+  if (!window.confirm("删除缓存会把下载的视频/图片/PDF 一并移除，确定继续？")) return;
   pendingCacheSource = null;
   els.cacheModalDesc.textContent = "正在清除该内容的旧缓存…";
-  els.cacheModalRestore.disabled = true;
-  els.cacheModalClear.disabled = true;
+  setCacheButtonsBusy(true);
   try {
     const cache = source.cache || {};
     if (source.id) {
@@ -1057,8 +1126,7 @@ async function clearPendingCache() {
   } catch (error) {
     setStatus(els.importStatus, error.message || "清除缓存失败。", "error");
   } finally {
-    els.cacheModalRestore.disabled = false;
-    els.cacheModalClear.disabled = false;
+    setCacheButtonsBusy(false);
     els.cacheModal.classList.add("hidden");
   }
 }
@@ -3306,6 +3374,7 @@ els.loginModal.addEventListener("click", (e) => {
 
 // —— 缓存“恢复/清除”弹窗 ——
 els.cacheModalRestore.addEventListener("click", resumePendingCache);
+els.cacheModalReset.addEventListener("click", resetPendingCache);
 els.cacheModalClear.addEventListener("click", clearPendingCache);
 els.cacheModalClose.addEventListener("click", () => {
   els.cacheModal.classList.add("hidden");

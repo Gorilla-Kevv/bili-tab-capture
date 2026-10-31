@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -860,6 +861,23 @@ def api_version():
     })
 
 
+@app.post("/api/shutdown")
+def api_shutdown():
+    """启动器用：结束当前服务（不依赖 pid，孤儿实例也能停）。
+
+    自定义头要求让浏览器跨站表单无法直接触发；服务本身只监听 127.0.0.1。
+    """
+    if request.headers.get("X-BiliTabCapture") != "1":
+        return json_error("无权限。", 403)
+
+    def _exit() -> None:
+        time.sleep(0.15)
+        os._exit(0)
+
+    threading.Thread(target=_exit, daemon=True).start()
+    return jsonify({"ok": True})
+
+
 SKIPPED_VERSION_FILE = CACHE_DIR / "skipped_version.txt"
 
 
@@ -932,6 +950,28 @@ def cached_job_video_path(source_id: str, cache_dir: Path) -> Optional[Path]:
         return found
     raw = source.get("video_path")
     return Path(raw) if raw else None
+
+
+def find_active_job(source_id: str) -> Optional[Dict[str, Any]]:
+    """刷新页面时用来恢复“正在生成”的任务（已完成/失败的 job 不算）。"""
+    with STORE_LOCK:
+        candidates = [
+            job
+            for job in JOBS.values()
+            if job.get("source_id") == source_id
+            and job.get("status") in ("queued", "running")
+        ]
+    if not candidates:
+        return None
+    job = max(candidates, key=lambda item: item.get("created_at") or 0)
+    return {
+        "job_id": job.get("id"),
+        "status": job.get("status"),
+        "phase": job.get("phase"),
+        "stats": job.get("stats"),
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
 
 
 def find_cached_job_id(source_id: str, cache_dir: Path) -> Optional[str]:
@@ -1278,19 +1318,25 @@ def cache_clear():
         import shutil as _sh
         _sh.rmtree(cache_dir, ignore_errors=True)
         cache_dir.mkdir(parents=True, exist_ok=True)   # 保留空目录让后续照常写入
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "fully_cleared": True})
 
+    # 重置进度：只删截图/渲染缓存，保留下载的视频、master 图片/PDF。
+    prior = load_state_json(cache_dir) or {}
+    meta = prior.get("metadata") or {}
     for old in (cache_dir / "crops").glob("*.png"):
         old.unlink(missing_ok=True)
-    # PDF：渲染图也要一并清掉，否则“从新开始”后仍会命中旧 DPI 的渲染缓存。
+    # PDF：渲染图也要一并清掉，否则重置后仍会命中旧 DPI 的渲染缓存。
     for old in (cache_dir / "pages").glob("*.png"):
         old.unlink(missing_ok=True)
     for old in (cache_dir / "pages").glob(".dpi*.txt"):
         old.unlink(missing_ok=True)
     (cache_dir / "state.json").unlink(missing_ok=True)
-    # 注意：不清除 SOURCES/JOBS 里的内存 source——用户“从新开始”后仍要沿用同一个
-    # source 继续处理当前文件，只是不再命中旧缓存。
-    return jsonify({"ok": True})
+    # 重写一份只含 metadata 的占位 state：标题/作者/来源还在，历史记录不会变成裸 hash。
+    if meta:
+        ensure_placeholder_state(cache_dir, meta)
+    # 注意：不清除 SOURCES/JOBS 里的内存 source——用户重置后仍要沿用当前文件，
+    # 只是不再命中旧截图；前端随后会通过 /api/history/restore 重建新 source。
+    return jsonify({"ok": True, "fully_cleared": False})
 
 
 # --------------------------------------------------------------------------
@@ -1608,11 +1654,17 @@ def api_history_restore():
             if master is None:
                 return json_error("PDF 原文件缺失。", 404)
             state = load_state_json(cache_dir) or {}
+            page_count = state.get("page_count")
+            if not page_count:
+                try:
+                    page_count = pdf_render.pdf_page_count(master)
+                except PdfRenderError:
+                    page_count = None
             source = {
                 "id": source_id, "type": "pdf",
                 "path": str(master),
                 "metadata": meta, "duration": None,
-                "page_count": state.get("page_count"),
+                "page_count": page_count,
                 "dpi": read_capture_dpi(state.get("pdf_dpi")),
                 "pdf_dpi": read_capture_dpi(state.get("pdf_dpi")),
                 "cache_dir": str(cache_dir),
@@ -2671,6 +2723,9 @@ def source_instance(source_id: str):
         return json_error("未知的视频源。", 404)
 
     result = dict(source)
+    active = find_active_job(source_id)
+    if active:
+        result["active_job"] = active
     cache_dir_str = result.get("cache_dir")
     if cache_dir_str:
         cache_dir = Path(cache_dir_str)

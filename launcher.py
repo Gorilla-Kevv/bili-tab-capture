@@ -30,7 +30,7 @@ import urllib.parse
 import uuid
 import webbrowser
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from runtime_paths import data_dir
 
@@ -58,6 +58,14 @@ def _log_path() -> Path:
     return _cache_dir() / "launcher-server.log"
 
 
+def _servers_dir() -> Path:
+    return _cache_dir() / "servers"
+
+
+def _registry_path(port: int, pid: int) -> Path:
+    return _servers_dir() / f"{int(port)}-{int(pid)}.json"
+
+
 # --------------------------------------------------------------------------
 # 本地 HTTP（只用 http.client：绕过系统代理，避免 localhost 被代理劫持）
 # --------------------------------------------------------------------------
@@ -68,15 +76,16 @@ def _request(
     path: str,
     form: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, Any]:
     body = None
-    headers: Dict[str, str] = {}
+    hdrs: Dict[str, str] = dict(headers or {})
     if form is not None:
         body = urllib.parse.urlencode(form).encode("utf-8")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
     conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
     try:
-        conn.request(method, path, body=body, headers=headers)
+        conn.request(method, path, body=body, headers=hdrs)
         resp = conn.getresponse()
         raw = resp.read()
         ctype = resp.getheader("Content-Type") or ""
@@ -178,6 +187,60 @@ def _find_server(preferred_port: int) -> Optional[Dict[str, Any]]:
         if _health(port) is not None:
             return {"app": APP_TAG, "port": port, "url": f"http://127.0.0.1:{port}"}
     return None
+
+
+def _public_server(info: Dict[str, Any]) -> Dict[str, Any]:
+    port = info.get("port")
+    return {
+        "pid": info.get("pid"),
+        "port": port,
+        "url": info.get("url") or f"http://127.0.0.1:{port}",
+        "version": info.get("version"),
+        "started_at": info.get("started_at"),
+    }
+
+
+def _live_servers() -> List[Dict[str, Any]]:
+    """canonical server.json + servers/ 注册表里所有活着的本副本实例。
+
+    注册表按 `端口-pid.json` 存放；即使 server.json 丢了/被覆盖，随机端口的实例
+    也能在这里被找到。健康检查仍会校验 data_dir，其他副本的实例不会误算进来。
+    """
+    found: Dict[Tuple[int, int], Dict[str, Any]] = {}
+    candidates: List[Tuple[Dict[str, Any], Optional[Path]]] = []
+    canonical = _read_info()
+    if canonical:
+        candidates.append((canonical, None))
+    reg_dir = _servers_dir()
+    if reg_dir.exists():
+        for path in reg_dir.glob("*.json"):
+            info = _read_info(path)
+            if not info:
+                path.unlink(missing_ok=True)
+                continue
+            candidates.append((info, path))
+    for info, registry in candidates:
+        try:
+            port = int(info["port"])
+            pid = int(info.get("pid") or 0)
+        except (KeyError, TypeError, ValueError):
+            if registry is not None:
+                registry.unlink(missing_ok=True)
+            continue
+        key = (pid, port)
+        if key in found:
+            if registry is not None:
+                found[key]["_registry"] = str(registry)
+            continue
+        if _health(port) is None:
+            if registry is not None:
+                registry.unlink(missing_ok=True)
+            continue
+        item = dict(info)
+        if registry is not None:
+            item["_registry"] = str(registry)
+        found[key] = item
+    return sorted(found.values(), key=lambda item: int(item.get("port") or 0))
 
 
 # --------------------------------------------------------------------------
@@ -377,13 +440,13 @@ def _terminate_pid(pid: int) -> bool:
 
 
 def _status_payload(preferred_port: int) -> Dict[str, Any]:
+    servers = _live_servers()
+    if not servers:
+        found = _find_server(preferred_port)
+        if found:
+            servers = [found]
     info = _read_info()
-    live = None
-    if info and _health(int(info["port"])) is not None:
-        live = info
-    else:
-        live = _find_server(preferred_port)
-    if live is None:
+    if not servers:
         payload: Dict[str, Any] = {
             "ok": True,
             "app": APP_TAG,
@@ -393,75 +456,136 @@ def _status_payload(preferred_port: int) -> Dict[str, Any]:
         if info:
             payload["stale"] = {"pid": info.get("pid"), "port": info.get("port")}
         return payload
-    port = int(live["port"])
-    return {
+    primary = None
+    if info:
+        for item in servers:
+            if (
+                int(item.get("port") or 0) == int(info.get("port") or 0)
+                and int(item.get("pid") or 0) == int(info.get("pid") or 0)
+            ):
+                primary = item
+                break
+    if primary is None:
+        primary = servers[0]
+    payload = {
         "ok": True,
         "app": APP_TAG,
         "running": True,
-        "pid": live.get("pid"),
-        "port": port,
-        "url": live.get("url") or f"http://127.0.0.1:{port}",
-        "version": live.get("version"),
-        "started_at": live.get("started_at"),
         "log": str(_log_path()),
+        "servers": [_public_server(item) for item in servers],
     }
+    payload.update(_public_server(primary))
+    return payload
 
 
-def _stop_payload(preferred_port: int) -> Dict[str, Any]:
-    live = _live_server()
-    if live is None:
-        live = _find_server(preferred_port)
-    if live is None:
+def _stop_target(info: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    port = int(info["port"])
+    pid = info.get("pid")
+    how = ""
+    # 优先走 HTTP shutdown：不依赖 pid，/api/shutdown 有自定义头防跨站简单请求。
+    try:
+        status, _data = _request(
+            port,
+            "POST",
+            "/api/shutdown",
+            timeout=3,
+            headers={"X-BiliTabCapture": "1"},
+        )
+        if status == 200:
+            how = "shutdown"
+    except Exception:
+        pass
+    if not how and pid and _terminate_pid(int(pid)):
+        how = "pid"
+    if not how:
+        return False, "缺少 pid 且服务不支持 shutdown", info
+    deadline = time.time() + 10.0
+    while time.time() < deadline and _health(port, timeout=0.5) is not None:
+        time.sleep(0.2)
+    if _health(port, timeout=0.5) is not None and how != "pid" and pid:
+        # shutdown 没生效时退回强杀。
+        if _terminate_pid(int(pid)):
+            deadline = time.time() + 5.0
+            while time.time() < deadline and _health(port, timeout=0.5) is not None:
+                time.sleep(0.2)
+    if _health(port, timeout=0.5) is not None:
+        return False, "进程未在 10 秒内退出", info
+    registry = info.get("_registry")
+    if registry:
+        Path(registry).unlink(missing_ok=True)
+    canonical = _read_info()
+    if canonical:
+        try:
+            same = (
+                int(canonical.get("port") or 0) == port
+                and int(canonical.get("pid") or 0) == int(pid or 0)
+            )
+        except (TypeError, ValueError):
+            same = False
+        if same:
+            _info_path().unlink(missing_ok=True)
+    return True, how, info
+
+
+def _stop_payload(preferred_port: int, stop_all: bool = False) -> Dict[str, Any]:
+    servers = _live_servers()
+    if not servers:
+        found = _find_server(preferred_port)
+        if found:
+            servers = [found]
+    if not servers:
         stale = _read_info()
         if stale:
             _info_path().unlink(missing_ok=True)
+        reg_dir = _servers_dir()
+        if reg_dir.exists():
+            for path in reg_dir.glob("*.json"):
+                item = _read_info(path)
+                if item is None or _health(int(item["port"])) is None:
+                    path.unlink(missing_ok=True)
+        _lock_path().unlink(missing_ok=True)
         return {
             "ok": True,
             "app": APP_TAG,
-            "stopped": False,
+            "stopped": [],
             "running": False,
             "stale_removed": bool(stale),
         }
-    pid = live.get("pid")
-    port = int(live["port"])
-    if not pid:
-        return {
-            "ok": False,
-            "app": APP_TAG,
-            "error": "能找到服务但缺少 pid，无法安全停止；请手动结束该进程。",
-            "port": port,
-        }
-    if not _terminate_pid(int(pid)):
-        return {
-            "ok": False,
-            "app": APP_TAG,
-            "error": "发送停止信号失败。",
-            "pid": pid,
-            "port": port,
-        }
-    deadline = time.time() + 10.0
-    while time.time() < deadline:
-        if _health(port, timeout=0.5) is None:
-            break
-        time.sleep(0.2)
-    if _health(port, timeout=0.5) is not None:
-        return {
-            "ok": False,
-            "app": APP_TAG,
-            "error": "进程未在 10 秒内退出。",
-            "pid": pid,
-            "port": port,
-        }
-    _info_path().unlink(missing_ok=True)
-    _lock_path().unlink(missing_ok=True)
-    return {
-        "ok": True,
+    canonical = _read_info()
+    primary = None
+    if canonical:
+        for item in servers:
+            if (
+                int(item.get("port") or 0) == int(canonical.get("port") or 0)
+                and int(item.get("pid") or 0) == int(canonical.get("pid") or 0)
+            ):
+                primary = item
+                break
+    if primary is None:
+        primary = servers[0]
+    targets = servers if stop_all else [primary]
+    stopped: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for item in targets:
+        ok, detail, info = _stop_target(item)
+        if ok:
+            stopped.append({"pid": info.get("pid"), "port": info.get("port"), "how": detail})
+        else:
+            errors.append({"pid": info.get("pid"), "port": info.get("port"), "error": detail})
+    remaining = _live_servers()
+    if not remaining:
+        _lock_path().unlink(missing_ok=True)
+    payload: Dict[str, Any] = {
+        "ok": not errors,
         "app": APP_TAG,
-        "stopped": True,
-        "running": False,
-        "pid": pid,
-        "port": port,
+        "stopped": stopped,
+        "running": bool(remaining),
+        "remaining": [_public_server(item) for item in remaining],
     }
+    if errors:
+        payload["error"] = errors[0]["error"]
+        payload["errors"] = errors
+    return payload
 
 
 def _ensure_server(
@@ -537,7 +661,9 @@ def serve(
         "version": getattr(module, "APP_VERSION", ""),
         "started_at": time.time(),
     }
+    registry = _registry_path(actual, os.getpid())
     _write_info(_info_path(), info)
+    _write_info(registry, info)
     if info_file:
         _write_info(Path(info_file), info)
 
@@ -555,6 +681,7 @@ def serve(
     finally:
         server.server_close()
         _remove_info(_info_path(), actual)
+        _remove_info(registry, actual)
         if info_file:
             Path(info_file).unlink(missing_ok=True)
     return 0
@@ -716,7 +843,12 @@ def main(module, entry: Optional[Path] = None, argv: Optional[list] = None) -> i
         "--status", action="store_true", help="查看当前共享服务是否在运行（JSON）。"
     )
     actions.add_argument(
-        "--stop", action="store_true", help="停止 server.json 记录的共享服务（JSON）。"
+        "--stop", action="store_true", help="停止共享服务（JSON）。"
+    )
+    parser.add_argument(
+        "--stop-all",
+        action="store_true",
+        help="停止本副本的所有服务实例（含随机端口；依赖 servers/ 注册表）。",
     )
     parser.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--info-file", default=None, help=argparse.SUPPRESS)
@@ -728,8 +860,8 @@ def main(module, entry: Optional[Path] = None, argv: Optional[list] = None) -> i
     if args.status:
         _emit(_status_payload(args.port))
         return 0
-    if args.stop:
-        payload = _stop_payload(args.port)
+    if args.stop or args.stop_all:
+        payload = _stop_payload(args.port, stop_all=args.stop_all)
         _emit(payload)
         return 0 if payload.get("ok") else 1
 

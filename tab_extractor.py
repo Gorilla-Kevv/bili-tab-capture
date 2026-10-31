@@ -2048,159 +2048,159 @@ def build_long_image(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extrae tablatura de un video y genera un PDF con capturas."
+        description="从视频中提取谱面截图并生成 PDF。"
     )
 
     parser.add_argument(
         "source",
-        help="Bilibili URL（BV/av 号）或 ruta a archivo de video local",
+        help="Bilibili 链接（BV/av 号）或本地视频路径",
     )
 
     parser.add_argument(
         "--output",
         default="tablatura.pdf",
-        help="Nombre del PDF de salida (default: tablatura.pdf)",
+        help="输出 PDF 文件名（默认 tablatura.pdf）",
     )
 
     parser.add_argument(
         "--title",
         default=None,
-        help="Título a mostrar en la portada del PDF. Sobrescribe el título del video.",
+        help="PDF 首页标题（覆盖视频原标题）",
     )
 
     parser.add_argument(
         "--channel",
         default=None,
-        help="Canal o autor a mostrar en la portada del PDF. Sobrescribe el canal del video.",
+        help="PDF 署名/作者（覆盖视频频道）",
     )
 
     parser.add_argument(
         "--sample-every",
         type=float,
         default=2.0,
-        help="Tomar una captura cada X segundos (default: 2.0)",
+        help="每隔 X 秒采样一帧（默认 2.0）",
     )
 
     parser.add_argument(
         "--crop-top-ratio",
         type=float,
         default=1.0,
-        help="Compatibilidad: porcentaje superior a recortar (default: 1.0).",
+        help="兼容旧参数：从顶部裁掉的百分比（默认 1.0）",
     )
 
     parser.add_argument(
         "--crop-y-start",
         type=float,
         default=None,
-        help="Inicio vertical del recorte, de 0.0 a 1.0. Útil para tabs abajo.",
+        help="裁剪框上边界（0.0–1.0），适合谱面在画面下方",
     )
 
     parser.add_argument(
         "--crop-y-end",
         type=float,
         default=None,
-        help="Final vertical del recorte, de 0.0 a 1.0. Útil para tabs abajo.",
+        help="裁剪框下边界（0.0–1.0）",
     )
 
     parser.add_argument(
         "--crop-x-start",
         type=float,
         default=None,
-        help="Inicio horizontal del recorte, de 0.0 a 1.0 (default: 0.0).",
+        help="裁剪框左边界（0.0–1.0，默认 0.0）",
     )
 
     parser.add_argument(
         "--crop-x-end",
         type=float,
         default=None,
-        help="Final horizontal del recorte, de 0.0 a 1.0 (default: 1.0).",
+        help="裁剪框右边界（0.0–1.0，默认 1.0）",
     )
 
     parser.add_argument(
         "--hash-threshold",
         type=int,
         default=16,
-        help="Compatibilidad: ya no se usa como criterio principal (default: 16)",
+        help="兼容旧参数：已不作为主要判重条件（默认 16）",
     )
 
     parser.add_argument(
         "--hash-size",
         type=int,
         default=12,
-        help="Compatibilidad: ya no se usa como criterio principal (default: 12)",
+        help="兼容旧参数：已不作为主要判重条件（默认 12）",
     )
 
     parser.add_argument(
         "--diff-threshold",
         type=float,
         default=0.010,
-        help="Máxima proporción de píxeles cambiados para considerar duplicado (default: 0.010)",
+        help="判定为重复的最大像素变化比例（默认 0.010）",
     )
 
     parser.add_argument(
         "--compare-window",
         type=int,
         default=1,
-        help="Cantidad de capturas recientes contra las que comparar (default: 1)",
+        help="与最近多少张截图比较（默认 1）",
     )
 
     parser.add_argument(
         "--debug-diffs",
         action="store_true",
-        help="Guarda imágenes de diff además de las imágenes normalizadas/enmascaradas.",
+        help="额外保存 diff 调试图",
     )
 
     parser.add_argument(
         "--start",
         type=float,
         default=0.0,
-        help="Segundo inicial desde donde procesar",
+        help="起始秒数",
     )
 
     parser.add_argument(
         "--end",
         type=float,
         default=None,
-        help="Segundo final hasta donde procesar",
+        help="结束秒数",
     )
 
     parser.add_argument(
         "--keep-images",
         action="store_true",
-        help="Si se pasa, conserva las capturas intermedias en una carpeta",
+        help="保留中间截图到工作目录",
     )
 
     parser.add_argument(
         "--keep-comparison-images",
         action="store_true",
-        help="Guarda las imágenes usadas para comparar duplicados. Muy útil para debug.",
+        help="保存判重比较图（调试用）",
     )
 
     parser.add_argument(
         "--save-cleaned",
         action="store_true",
-        help="Guardar en el PDF las imágenes con la franja borrada en vez de las originales",
+        help="PDF 使用擦除播放条后的图片",
     )
 
     parser.add_argument(
         "--band-half-width",
         type=int,
         default=90,
-        help="Medio ancho de la franja vertical a ignorar en píxeles (default: 90)",
+        help="播放条检测条带半宽（像素，默认 90）",
     )
 
     parser.add_argument(
         "--min-band-pixels",
         type=int,
         default=20,
-        help="Mínima concentración de píxeles azul/verde para detectar la franja (default: 20)",
+        help="播放条最小像素数（默认 20）",
     )
 
     parser.add_argument(
         "--target-tolerance",
         type=int,
         default=48,
-        help="Tolerancia para detectar el color #ccd8f0 (default: 48)",
+        help="播放条颜色容差（默认 48）",
     )
 
     args = parser.parse_args()

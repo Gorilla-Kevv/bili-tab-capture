@@ -284,8 +284,12 @@
       </label>
       <div class="selection-bar" id="selectionBar">
         <span class="selection-count" id="selectionCount">未选择</span>
-        <span class="selection-hint">Ctrl+A 全选；按住 Ctrl 拖动框选；拖动选中卡片的裁剪边可批量调整</span>
+        <span class="selection-hint">Ctrl+A 全选；按住 Ctrl 拖动框选；拖动选中卡片的裁剪边可批量调整；Ctrl+Z / Ctrl+Shift+Z 撤销/重做</span>
         <div class="selection-actions">
+          <button class="secondary-button selection-button" id="undoButton" type="button" disabled
+            title="撤销 (Ctrl+Z)">撤销</button>
+          <button class="secondary-button selection-button" id="redoButton" type="button" disabled
+            title="重做 (Ctrl+Shift+Z)">重做</button>
           <button class="secondary-button selection-button" id="selectAllButton" type="button">全选</button>
           <button class="secondary-button selection-button" id="clearSelectionButton" type="button" disabled>取消选择</button>
         </div>

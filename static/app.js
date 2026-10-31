@@ -42,6 +42,12 @@ const state = {
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
+// 第 3 步撤销/重做：按图片快照记录（不需要后端额外接口）。
+const undoStack = [];
+const redoStack = [];
+const UNDO_LIMIT = 80;
+let step3Busy = 0;
+
 const els = {
   importPanel: document.getElementById("importPanel"),
   importForm: document.getElementById("importForm"),
@@ -114,6 +120,8 @@ const els = {
   selectionCount: document.getElementById("selectionCount"),
   selectAllButton: document.getElementById("selectAllButton"),
   clearSelectionButton: document.getElementById("clearSelectionButton"),
+  undoButton: document.getElementById("undoButton"),
+  redoButton: document.getElementById("redoButton"),
   autoCropButton: document.getElementById("autoCropButton"),
   autoMeasureButton: document.getElementById("autoMeasureButton"),
   coeffHorizontal: document.getElementById("coeffHorizontal"),
@@ -885,6 +893,7 @@ function resetExtractionState() {
   }
   if (state.selectedFiles) state.selectedFiles.clear();
   if (els.cardList) updateSelectionUI();
+  clearEditHistory();
 
   els.generateButton.disabled = false;
   hideExtractProgress();
@@ -1647,6 +1656,126 @@ function applyHiddenVisibility() {
   });
 }
 
+/* ===================== 第 3 步撤销 / 重做 ===================== */
+
+function isTextEditingTarget(target) {
+  if (!target) return false;
+  const tag = String(target.tagName || "");
+  const inputType = String(target.type || "").toLowerCase();
+  return (
+    Boolean(target.isContentEditable) ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT" ||
+    (tag === "INPUT" &&
+      !["checkbox", "radio", "button", "submit", "range", "color"].includes(
+        inputType
+      ))
+  );
+}
+
+function cloneImageForHistory(m) {
+  return {
+    file: m.file,
+    url: m.url,
+    t: m.t ?? 0,
+    w: m.w,
+    h: m.h,
+    hidden: !!m.hidden,
+    autoHidden: !!m.autoHidden,
+    crop: {
+      l: m.crop?.l ?? 0,
+      r: m.crop?.r ?? 1,
+      t: m.crop?.t ?? 0,
+      b: m.crop?.b ?? 1,
+    },
+    measures: [...(m.measures || [])],
+  };
+}
+
+function snapshotImages() {
+  return state.images.map(cloneImageForHistory);
+}
+
+function updateUndoRedoUI() {
+  const busy = step3Busy > 0;
+  if (els.undoButton) {
+    els.undoButton.disabled = busy || undoStack.length === 0;
+    els.undoButton.title =
+      undoStack.length > 0
+        ? `撤销：${undoStack[undoStack.length - 1].label} (Ctrl+Z)`
+        : "没有可撤销的操作";
+  }
+  if (els.redoButton) {
+    els.redoButton.disabled = busy || redoStack.length === 0;
+    els.redoButton.title =
+      redoStack.length > 0
+        ? `重做：${redoStack[redoStack.length - 1].label} (Ctrl+Shift+Z)`
+        : "没有可重做的操作";
+  }
+}
+
+function clearEditHistory() {
+  undoStack.length = 0;
+  redoStack.length = 0;
+  updateUndoRedoUI();
+}
+
+function pushUndo(label) {
+  undoStack.push({ images: snapshotImages(), label: label || "编辑" });
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  updateUndoRedoUI();
+}
+
+function commitUndoSnapshot(before, label) {
+  if (!before) return;
+  if (JSON.stringify(before) === JSON.stringify(snapshotImages())) return;
+  undoStack.push({ images: before, label: label || "编辑" });
+  if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+  redoStack.length = 0;
+  updateUndoRedoUI();
+}
+
+function restoreHistoryImages(images) {
+  state.images = images.map(cloneImageForHistory);
+  persistSnapshot = null; // 强制下一次保存发送完整图片列表
+  renderCardList();
+  updateSelectionUI();
+  updateUndoRedoUI();
+}
+
+function undoEdit() {
+  if (step3Busy > 0 || cardDrag || sortDrag || undoStack.length === 0) {
+    return false;
+  }
+  const entry = undoStack.pop();
+  redoStack.push({ images: snapshotImages(), label: entry.label });
+  restoreHistoryImages(entry.images);
+  showToast(`已撤销：${entry.label}`, "success");
+  return true;
+}
+
+function redoEdit() {
+  if (step3Busy > 0 || cardDrag || sortDrag || redoStack.length === 0) {
+    return false;
+  }
+  const entry = redoStack.pop();
+  undoStack.push({ images: snapshotImages(), label: entry.label });
+  restoreHistoryImages(entry.images);
+  showToast(`已重做：${entry.label}`, "success");
+  return true;
+}
+
+function beginStep3Busy() {
+  step3Busy += 1;
+  updateUndoRedoUI();
+}
+
+function endStep3Busy() {
+  step3Busy = Math.max(0, step3Busy - 1);
+  updateUndoRedoUI();
+}
+
 /* ===================== 第 3 步多选 / 批量裁剪 ===================== */
 
 function cardElementForIndex(index) {
@@ -1955,6 +2084,7 @@ function detectParams() {
 async function autoCrop() {
   const files = state.images.map((m) => m.file);
   if (!files.length) return { hidden: 0 };
+  pushUndo("自动裁剪");
   const data = await fetchJson("/api/stitch", {
     method: "POST",
     headers: JSON_HEADERS,
@@ -2033,6 +2163,7 @@ async function autoCrop() {
 async function autoMeasures() {
   const files = state.images.map((m) => m.file);
   if (!files.length) return;
+  pushUndo("自动识别小节线");
   const data = await fetchJson("/api/detect_measures", {
     method: "POST",
     headers: JSON_HEADERS,
@@ -2418,6 +2549,7 @@ function buildCard(m, index) {
 function toggleHidden(index) {
   const m = state.images[index];
   if (!m) return;
+  pushUndo(m.hidden ? "显示图片" : "隐藏图片");
   m.hidden = !m.hidden;
   syncCardList();
 }
@@ -2486,8 +2618,10 @@ async function insertFromVideo(index) {
       return;
     }
   }
+  pushUndo("补插截图");
   state.inserting = true;
   const pending = showToast("正在插入...", "", { persist: true });
+  beginStep3Busy();
   try {
     const data = await fetchJson("/api/insert_captures", {
       method: "POST",
@@ -2518,6 +2652,7 @@ async function insertFromVideo(index) {
     pending.resolve(e.message, "error");
   } finally {
     state.inserting = false;
+    endStep3Busy();
   }
 }
 
@@ -2557,7 +2692,9 @@ async function uploadImageFile(fileOrBlob) {
 }
 
 async function uploadAndInsert(index, fileOrBlob) {
+  pushUndo("插入图片");
   const pending = showToast("正在上传图片...", "", { persist: true });
+  beginStep3Busy();
   try {
     const data = await uploadImageFile(fileOrBlob);
     const newImg = {
@@ -2577,14 +2714,18 @@ async function uploadAndInsert(index, fileOrBlob) {
     pending.resolve("已插入图片", "success");
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
 async function insertLocalFiles(index, files) {
   files = Array.from(files || []).filter(Boolean);
   if (!files.length) return;
+  pushUndo("插入图片");
   const pending = showToast("正在上传图片...", "", { persist: true });
   const inserted = [];
+  beginStep3Busy();
   try {
     for (let k = 0; k < files.length; k++) {
       const data = await uploadImageFile(files[k]);
@@ -2607,11 +2748,15 @@ async function insertLocalFiles(index, files) {
     closeInsertModal();
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
 async function replaceCardImage(index, file) {
+  pushUndo("替换图片");
   const pending = showToast("正在替换图片...", "", { persist: true });
+  beginStep3Busy();
   try {
     const fd = new FormData();
     fd.append("job_id", state.captureJobId);
@@ -2629,6 +2774,8 @@ async function replaceCardImage(index, file) {
     pending.resolve("已替换图片", "success");
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
@@ -2680,6 +2827,7 @@ function beginCardSort(index, card, event) {
     clientX: event.clientX,
     clientY: event.clientY,
     moved: false,
+    historySnapshot: snapshotImages(),
   };
   card.classList.add("is-sorting");
   event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -2722,7 +2870,7 @@ function dragCardSort(event) {
 
 function endCardSort() {
   if (!sortDrag) return;
-  const { from, to, toObj, moved } = sortDrag;
+  const { from, to, toObj, moved, historySnapshot } = sortDrag;
   if (moved && toObj && toObj !== state.images[from]) {
     const [movedImg] = state.images.splice(from, 1);
     const targetIdx = state.images.indexOf(toObj);
@@ -2731,6 +2879,7 @@ function endCardSort() {
       const insertAt = from < to ? targetIdx + 1 : targetIdx;
       state.images.splice(insertAt, 0, movedImg);
     }
+    commitUndoSnapshot(historySnapshot, "卡片排序");
   } else if (!moved) {
     showToast("按住拖动卡片到目标位置进行排序");
   }
@@ -2780,6 +2929,8 @@ function beginCardCrop(index, side, event) {
     startValue: cropValueFor(m.crop, side),
     pxWidth: rect.width || 1,
     pxHeight: rect.height || 1,
+    historySnapshot: snapshotImages(),
+    historyLabel: "调整裁剪",
   };
 }
 
@@ -2805,6 +2956,8 @@ function clickCardCrop(index, event) {
     startValue,
     pxWidth: rect.width || 1,
     pxHeight: rect.height || 1,
+    historySnapshot: snapshotImages(),
+    historyLabel: "调整裁剪",
   };
   event.currentTarget.classList.add("is-cropping");
   applyCardCropValue(index, side, startValue);
@@ -2854,7 +3007,9 @@ function dragCardCrop(event) {
 
 function endCardCrop() {
   if (!cardDrag) return;
+  const drag = cardDrag;
   cardDrag = null;
+  commitUndoSnapshot(drag.historySnapshot, drag.historyLabel);
   syncCardList();
 }
 
@@ -2889,7 +3044,9 @@ async function splitCard(index, splitBtn, event) {
   const preview = splitBtn.closest(".card")?.querySelector(".card-preview");
   const rect = preview ? preview.getBoundingClientRect() : splitBtn.getBoundingClientRect();
   const ratio = clamp((event.clientY - rect.top) / rect.height, b.min, b.max);
+  pushUndo("横向分割");
   const pending = showToast("正在分割...", "", { persist: true });
+  beginStep3Busy();
   try {
     const data = await fetchJson("/api/split_image", {
       method: "POST",
@@ -2918,6 +3075,8 @@ async function splitCard(index, splitBtn, event) {
     pending.resolve("已分割为两张图片", "success");
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
@@ -2931,7 +3090,9 @@ async function mergeCardUpward(index) {
     showToast("没有上方图片可合并", "error");
     return;
   }
+  pushUndo("合并到上方");
   const pending = showToast("正在合并...", "", { persist: true });
+  beginStep3Busy();
   try {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
@@ -2956,6 +3117,8 @@ async function mergeCardUpward(index) {
     pending.resolve("已合并到上方", "success");
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
@@ -2969,7 +3132,9 @@ async function mergeCardDownward(index) {
     showToast("没有下方图片可合并", "error");
     return;
   }
+  pushUndo("合并到下方");
   const pending = showToast("正在合并...", "", { persist: true });
+  beginStep3Busy();
   try {
     const data = await fetchJson("/api/merge_image", {
       method: "POST",
@@ -2994,6 +3159,8 @@ async function mergeCardDownward(index) {
     pending.resolve("已合并到下方", "success");
   } catch (e) {
     pending.resolve(e.message, "error");
+  } finally {
+    endStep3Busy();
   }
 }
 
@@ -3001,6 +3168,7 @@ async function mergeCardDownward(index) {
 function addMeasure(index, strip, event) {
   const m = state.images[index];
   if (!m) return;
+  pushUndo("添加小节线");
   const rect = strip.getBoundingClientRect();
   const p = clamp((event.clientX - rect.left) / rect.width, 0, 1);
   m.measures = m.measures || [];
@@ -3012,6 +3180,7 @@ function addMeasure(index, strip, event) {
 function deleteMeasure(index, x) {
   const m = state.images[index];
   if (!m) return;
+  pushUndo("删除小节线");
   m.measures = (m.measures || []).filter((mm) => Math.abs(mm - x) > 1e-6);
   syncCardList();
 }
@@ -3020,15 +3189,20 @@ function clearOrDetect(index) {
   const m = state.images[index];
   if (!m) return;
   if (m.measures && m.measures.length) {
+    pushUndo("清空小节线");
     m.measures = [];
     syncCardList();
   } else {
+    pushUndo("自动识别小节线");
     const pending = showToast("正在识别……", "", { persist: true });
+    beginStep3Busy();
     detectMeasuresFor([m.file]).then(() => {
       syncCardList();
       pending.resolve("已自动识别小节线", "success");
     }).catch((e) => {
       pending.resolve(e.message || "自动识别小节线失败。", "error");
+    }).finally(() => {
+      endStep3Busy();
     });
   }
 }
@@ -3731,28 +3905,44 @@ if (els.selectAllButton) {
 if (els.clearSelectionButton) {
   els.clearSelectionButton.addEventListener("click", clearSelection);
 }
+if (els.undoButton) {
+  els.undoButton.addEventListener("click", undoEdit);
+}
+if (els.redoButton) {
+  els.redoButton.addEventListener("click", redoEdit);
+}
 if (els.cardList) {
   els.cardList.addEventListener("pointerdown", beginCardMarquee, true);
 }
 document.addEventListener("keydown", (event) => {
   const mod = event.ctrlKey || event.metaKey;
-  if (mod && !event.altKey && String(event.key || "").toLowerCase() === "a") {
+  const key = String(event.key || "").toLowerCase();
+  const modalOpen = Boolean(
+    document.querySelector(".modal-overlay:not(.hidden)")
+  );
+  if (mod && !event.altKey && key === "a") {
     if (state.stage !== 3 || !state.images.length) return;
-    const target = event.target;
-    const tag = target ? String(target.tagName || "") : "";
-    const inputType = target ? String(target.type || "").toLowerCase() : "";
-    const isTextField =
-      Boolean(target && target.isContentEditable) ||
-      tag === "TEXTAREA" ||
-      tag === "SELECT" ||
-      (tag === "INPUT" &&
-        !["checkbox", "radio", "button", "submit", "range", "color"].includes(
-          inputType
-        ));
-    if (isTextField) return;
-    if (document.querySelector(".modal-overlay:not(.hidden)")) return;
+    if (isTextEditingTarget(event.target)) return;
+    if (modalOpen) return;
     event.preventDefault();
     selectAllVisibleCards();
+    return;
+  }
+  if (mod && !event.altKey && key === "z") {
+    if (state.stage !== 3 || isTextEditingTarget(event.target) || modalOpen) {
+      return;
+    }
+    event.preventDefault();
+    if (event.shiftKey) redoEdit();
+    else undoEdit();
+    return;
+  }
+  if (mod && !event.altKey && !event.shiftKey && key === "y") {
+    if (state.stage !== 3 || isTextEditingTarget(event.target) || modalOpen) {
+      return;
+    }
+    event.preventDefault();
+    redoEdit();
     return;
   }
   if (
@@ -3760,11 +3950,12 @@ document.addEventListener("keydown", (event) => {
     state.stage === 3 &&
     state.selectedFiles.size
   ) {
-    if (document.querySelector(".modal-overlay:not(.hidden)")) return;
+    if (modalOpen) return;
     event.preventDefault();
     clearSelection();
   }
 });
+updateUndoRedoUI();
 window.addEventListener("pointermove", dragCardSort);
 window.addEventListener("pointerup", endCardSort);
 window.addEventListener("pointercancel", endCardSort);
@@ -3781,6 +3972,7 @@ els.toLayoutButton.addEventListener("click", () => setStage(4));
 els.autoCropButton.addEventListener("click", async () => {
   if (hasAutoCrop()) {
     // 清空裁剪：恢复整图（保留手动设置的垂直裁剪和手动隐藏的图片）。
+    pushUndo("清空自动裁剪");
     let restored = 0;
     state.images.forEach((m) => {
       m.crop.l = 0;
@@ -3801,6 +3993,7 @@ els.autoCropButton.addEventListener("click", async () => {
   }
   const pending = showToast("正在自动裁剪…", "", { persist: true });
   els.autoCropButton.disabled = true;
+  beginStep3Busy();
   try {
     const result = await autoCrop();
     const hidden = result && result.hidden ? result.hidden : 0;
@@ -3814,11 +4007,13 @@ els.autoCropButton.addEventListener("click", async () => {
     pending.resolve(e.message || "自动裁剪失败。", "error");
   } finally {
     els.autoCropButton.disabled = false;
+    endStep3Busy();
   }
 });
 els.autoMeasureButton.addEventListener("click", async () => {
   if (hasMeasures()) {
     // 清空小节：清除所有截图的小节线标记。
+    pushUndo("清空小节线");
     state.images.forEach((m) => {
       m.measures = [];
     });
@@ -3828,6 +4023,7 @@ els.autoMeasureButton.addEventListener("click", async () => {
   }
   const pending = showToast("正在识别小节线…", "", { persist: true });
   els.autoMeasureButton.disabled = true;
+  beginStep3Busy();
   try {
     await autoMeasures();
     pending.resolve("已自动识别小节线。", "success");
@@ -3835,6 +4031,7 @@ els.autoMeasureButton.addEventListener("click", async () => {
     pending.resolve(e.message || "自动识别小节线失败。", "error");
   } finally {
     els.autoMeasureButton.disabled = false;
+    endStep3Busy();
   }
 });
 els.downloadPdfButton.addEventListener("click", downloadPdf);

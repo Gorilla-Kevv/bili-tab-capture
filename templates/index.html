@@ -282,6 +282,14 @@
         <input id="showHiddenCheckbox" type="checkbox" checked autocomplete="off">
         <span>显示已隐藏的图片</span>
       </label>
+      <div class="selection-bar" id="selectionBar">
+        <span class="selection-count" id="selectionCount">未选择</span>
+        <span class="selection-hint">Ctrl+A 全选；按住 Ctrl 拖动框选；拖动选中卡片的裁剪边可批量调整</span>
+        <div class="selection-actions">
+          <button class="secondary-button selection-button" id="selectAllButton" type="button">全选</button>
+          <button class="secondary-button selection-button" id="clearSelectionButton" type="button" disabled>取消选择</button>
+        </div>
+      </div>
       <div class="card-list" id="cardList"></div>
     </section>
 

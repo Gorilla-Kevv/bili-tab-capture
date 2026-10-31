@@ -27,6 +27,7 @@ const state = {
   maxStage: 1,
   captureJobId: null,
   images: [],
+  selectedFiles: new Set(),
   inserting: false,
   generating: false,
   insertIndex: null,
@@ -110,6 +111,9 @@ const els = {
   cardList: document.getElementById("cardList"),
   toLayoutButton: document.getElementById("toLayoutButton"),
   adjustStatus: document.getElementById("adjustStatus"),
+  selectionCount: document.getElementById("selectionCount"),
+  selectAllButton: document.getElementById("selectAllButton"),
+  clearSelectionButton: document.getElementById("clearSelectionButton"),
   autoCropButton: document.getElementById("autoCropButton"),
   autoMeasureButton: document.getElementById("autoMeasureButton"),
   coeffHorizontal: document.getElementById("coeffHorizontal"),
@@ -879,6 +883,8 @@ function resetExtractionState() {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
+  if (state.selectedFiles) state.selectedFiles.clear();
+  if (els.cardList) updateSelectionUI();
 
   els.generateButton.disabled = false;
   hideExtractProgress();
@@ -1641,6 +1647,153 @@ function applyHiddenVisibility() {
   });
 }
 
+/* ===================== 第 3 步多选 / 批量裁剪 ===================== */
+
+function cardElementForIndex(index) {
+  return els.cardList.querySelector(`.card[data-index="${index}"]`);
+}
+
+function updateSelectionUI() {
+  if (!els.cardList) return;
+  const existing = new Set(state.images.map((m) => m.file));
+  for (const file of Array.from(state.selectedFiles)) {
+    if (!existing.has(file)) state.selectedFiles.delete(file);
+  }
+  els.cardList.querySelectorAll(".card").forEach((card) => {
+    const index = Number(card.dataset.index);
+    const image = state.images[index];
+    const selected = Boolean(image && state.selectedFiles.has(image.file));
+    card.classList.toggle("is-selected", selected);
+    card.setAttribute("aria-selected", selected ? "true" : "false");
+  });
+  const count = state.selectedFiles.size;
+  if (els.selectionCount) {
+    els.selectionCount.textContent = count ? `已选 ${count} 张` : "未选择";
+  }
+  if (els.clearSelectionButton) els.clearSelectionButton.disabled = count === 0;
+}
+
+function clearSelection() {
+  if (!state.selectedFiles.size) return;
+  state.selectedFiles.clear();
+  updateSelectionUI();
+}
+
+function toggleCardSelection(file) {
+  if (!file) return;
+  if (state.selectedFiles.has(file)) state.selectedFiles.delete(file);
+  else state.selectedFiles.add(file);
+  updateSelectionUI();
+}
+
+function selectAllVisibleCards() {
+  const files = [];
+  els.cardList.querySelectorAll(".card").forEach((card) => {
+    if (card.classList.contains("is-hidden-by-toggle")) return;
+    const index = Number(card.dataset.index);
+    const image = state.images[index];
+    if (image && image.file) files.push(image.file);
+  });
+  state.selectedFiles = new Set(files);
+  updateSelectionUI();
+}
+
+let cardMarquee = null;
+let cardMarqueeEl = null;
+let selectionVisualRaf = null;
+
+function scheduleSelectionVisualRefresh() {
+  if (selectionVisualRaf !== null) return;
+  selectionVisualRaf = requestAnimationFrame(() => {
+    selectionVisualRaf = null;
+    els.cardList.querySelectorAll(".card").forEach((card) => {
+      const index = Number(card.dataset.index);
+      const image = state.images[index];
+      if (image && state.selectedFiles.has(image.file)) {
+        applyCardCropVisual(card, image);
+      }
+    });
+  });
+}
+
+function beginCardMarquee(event) {
+  if (!(event.ctrlKey || event.metaKey) || event.button !== 0) return;
+  if (state.stage !== 3) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const card = event.target.closest(".card");
+  cardMarquee = {
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
+    file: card ? card.dataset.file : null,
+  };
+  document.body.classList.add("is-marquee-select");
+  window.addEventListener("pointermove", dragCardMarquee, { passive: false });
+  window.addEventListener("pointerup", endCardMarquee);
+  window.addEventListener("pointercancel", endCardMarquee);
+}
+
+function dragCardMarquee(event) {
+  if (!cardMarquee) return;
+  const dx = event.clientX - cardMarquee.startX;
+  const dy = event.clientY - cardMarquee.startY;
+  if (!cardMarquee.moved && Math.hypot(dx, dy) < 4) return;
+  cardMarquee.moved = true;
+  const left = Math.min(cardMarquee.startX, event.clientX);
+  const right = Math.max(cardMarquee.startX, event.clientX);
+  const top = Math.min(cardMarquee.startY, event.clientY);
+  const bottom = Math.max(cardMarquee.startY, event.clientY);
+  if (!cardMarqueeEl) {
+    cardMarqueeEl = document.createElement("div");
+    cardMarqueeEl.className = "card-marquee";
+    document.body.appendChild(cardMarqueeEl);
+  }
+  cardMarqueeEl.style.left = `${left}px`;
+  cardMarqueeEl.style.top = `${top}px`;
+  cardMarqueeEl.style.width = `${right - left}px`;
+  cardMarqueeEl.style.height = `${bottom - top}px`;
+
+  // 框选替换当前选择；Ctrl+单击用于逐张增删。
+  const selected = new Set();
+  els.cardList.querySelectorAll(".card").forEach((card) => {
+    if (card.classList.contains("is-hidden-by-toggle")) return;
+    const rect = card.getBoundingClientRect();
+    const intersects = !(
+      rect.right < left ||
+      rect.left > right ||
+      rect.bottom < top ||
+      rect.top > bottom
+    );
+    if (intersects) {
+      const file = card.dataset.file;
+      if (file) selected.add(file);
+    }
+  });
+  state.selectedFiles = selected;
+  updateSelectionUI();
+  event.preventDefault();
+}
+
+function endCardMarquee(event) {
+  if (!cardMarquee) return;
+  const drag = cardMarquee;
+  cardMarquee = null;
+  window.removeEventListener("pointermove", dragCardMarquee);
+  window.removeEventListener("pointerup", endCardMarquee);
+  window.removeEventListener("pointercancel", endCardMarquee);
+  if (cardMarqueeEl) {
+    cardMarqueeEl.remove();
+    cardMarqueeEl = null;
+  }
+  document.body.classList.remove("is-marquee-select");
+  if (!drag.moved && drag.file) {
+    // 按住 Ctrl 单击卡片 = 切换这一张的选择。
+    toggleCardSelection(drag.file);
+  }
+  event.preventDefault();
+}
+
 function renderCardList() {
   numberMeasures();
   const scrollY = window.scrollY;
@@ -1653,6 +1806,7 @@ function renderCardList() {
   if (Math.abs(window.scrollY - scrollY) > 1) window.scrollTo(0, scrollY);
   syncAutoDetectButtons();
   syncSplitButtons();
+  updateSelectionUI();
   schedulePersist();
 }
 
@@ -1676,11 +1830,13 @@ function syncCardList() {
   if (Math.abs(window.scrollY - scrollY) > 1) window.scrollTo(0, scrollY);
   syncAutoDetectButtons();
   syncSplitButtons();
+  updateSelectionUI();
   schedulePersist();
 }
 
 function syncCardContent(card, m, i) {
   card.dataset.index = String(i);
+  card.dataset.file = m.file;
   if (m.hidden) card.dataset.hidden = "true";
   else delete card.dataset.hidden;
 
@@ -2607,6 +2763,10 @@ function cropValueFor(crop, side) {
 function beginCardCrop(index, side, event) {
   const m = state.images[index];
   if (!m) return;
+  // 有选择但拖动的是没选中的卡片：先取消选择，避免误以为在批量调整。
+  if (state.selectedFiles.size && !state.selectedFiles.has(m.file)) {
+    clearSelection();
+  }
   event.preventDefault();
   event.stopPropagation();
   const preview = event.currentTarget.closest(".card-preview");
@@ -2626,6 +2786,9 @@ function beginCardCrop(index, side, event) {
 function clickCardCrop(index, event) {
   const m = state.images[index];
   if (!m) return;
+  if (state.selectedFiles.size && !state.selectedFiles.has(m.file)) {
+    clearSelection();
+  }
   event.preventDefault();
   const rect = event.currentTarget.getBoundingClientRect();
   const px = clamp((event.clientX - rect.left) / rect.width, 0, 1);
@@ -2647,18 +2810,36 @@ function clickCardCrop(index, event) {
   applyCardCropValue(index, side, startValue);
 }
 
+function setCropEdge(crop, side, value) {
+  if (side === "left") {
+    crop.l = clamp(value, 0, Math.max(0, crop.r - CARD_MIN_CROP));
+  } else if (side === "right") {
+    crop.r = clamp(value, Math.min(1, crop.l + CARD_MIN_CROP), 1);
+  } else if (side === "top") {
+    crop.t = clamp(value, 0, Math.max(0, (crop.b ?? 1) - CARD_MIN_CROP_V));
+  } else {
+    crop.b = clamp(value, Math.min(1, (crop.t ?? 0) + CARD_MIN_CROP_V), 1);
+  }
+}
+
 function applyCardCropValue(index, side, val) {
   const m = state.images[index];
-  if (side === "left") {
-    m.crop.l = clamp(val, 0, m.crop.r - CARD_MIN_CROP);
-  } else if (side === "right") {
-    m.crop.r = clamp(val, m.crop.l + CARD_MIN_CROP, 1);
-  } else if (side === "top") {
-    m.crop.t = clamp(val, 0, (m.crop.b ?? 1) - CARD_MIN_CROP_V);
-  } else {
-    m.crop.b = clamp(val, (m.crop.t ?? 0) + CARD_MIN_CROP_V, 1);
+  setCropEdge(m.crop, side, val);
+
+  // 多选时把“这一条边的绝对值”同步到所有选中卡片；其他三条边各自保留。
+  if (state.selectedFiles.size > 1 && state.selectedFiles.has(m.file)) {
+    const key =
+      side === "left" ? "l" : side === "right" ? "r" : side === "top" ? "t" : "b";
+    const value = m.crop[key] ?? (side === "bottom" ? 1 : 0);
+    state.images.forEach((other, otherIndex) => {
+      if (otherIndex === index || !state.selectedFiles.has(other.file)) return;
+      setCropEdge(other.crop, side, value);
+    });
+    // 大量选中时把其他卡片的 DOM 更新合并到下一帧，避免每个 pointermove 卡顿。
+    scheduleSelectionVisualRefresh();
   }
-  const cardEl = els.cardList.querySelector(`.card[data-index="${index}"]`);
+
+  const cardEl = cardElementForIndex(index);
   if (cardEl) applyCardCropVisual(cardEl, m);
 }
 
@@ -3542,6 +3723,48 @@ els.previewImage.addEventListener("load", () => {
 window.addEventListener("pointermove", dragCardCrop);
 window.addEventListener("pointerup", endCardCrop);
 window.addEventListener("pointercancel", endCardCrop);
+
+// 多选：Ctrl+A 全选、Ctrl+拖动框选、Ctrl+点击切换；Esc 取消选择。
+if (els.selectAllButton) {
+  els.selectAllButton.addEventListener("click", selectAllVisibleCards);
+}
+if (els.clearSelectionButton) {
+  els.clearSelectionButton.addEventListener("click", clearSelection);
+}
+if (els.cardList) {
+  els.cardList.addEventListener("pointerdown", beginCardMarquee, true);
+}
+document.addEventListener("keydown", (event) => {
+  const mod = event.ctrlKey || event.metaKey;
+  if (mod && !event.altKey && String(event.key || "").toLowerCase() === "a") {
+    if (state.stage !== 3 || !state.images.length) return;
+    const target = event.target;
+    const tag = target ? String(target.tagName || "") : "";
+    const inputType = target ? String(target.type || "").toLowerCase() : "";
+    const isTextField =
+      Boolean(target && target.isContentEditable) ||
+      tag === "TEXTAREA" ||
+      tag === "SELECT" ||
+      (tag === "INPUT" &&
+        !["checkbox", "radio", "button", "submit", "range", "color"].includes(
+          inputType
+        ));
+    if (isTextField) return;
+    if (document.querySelector(".modal-overlay:not(.hidden)")) return;
+    event.preventDefault();
+    selectAllVisibleCards();
+    return;
+  }
+  if (
+    event.key === "Escape" &&
+    state.stage === 3 &&
+    state.selectedFiles.size
+  ) {
+    if (document.querySelector(".modal-overlay:not(.hidden)")) return;
+    event.preventDefault();
+    clearSelection();
+  }
+});
 window.addEventListener("pointermove", dragCardSort);
 window.addEventListener("pointerup", endCardSort);
 window.addEventListener("pointercancel", endCardSort);

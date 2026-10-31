@@ -113,11 +113,11 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
     - **实例注册表**：每个 `serve` 在 `cache/servers/<port>-<pid>.json` 写一份；`--status` / `--stop` / `--stop-all` 以它为准，即使 `server.json` 丢失/被覆盖也能找到随机端口实例。停止优先 `POST /api/shutdown`（自定义头 `X-BiliTabCapture: 1`，失败再按 pid 强杀）；`data_dir` 不匹配的其他副本实例不会被误停。
     - 另外：`launcher.serve()` 在启动清理前会探测是否已有实例在跑，有就跳过 `cleanup_orphan_transient()`，否则会删掉别的实例的 `runs/`、`previews/`。
 
-22. **MCP Server（stdio）**：`mcp_server.py` 使用**官方 `mcp>=2.0` SDK**（v2 已把 `FastMCP` 改名为 `MCPServer`，导入路径 `mcp.server.mcpserver`）。它是共享服务的 HTTP 客户端：导入/截图前用 `launcher.ensure_server()` 复用或拉起服务，其余全部走现有 API。
+22. **MCP Server（stdio）**：`mcp_server.py` 使用**官方 `mcp>=2.0,<3` SDK**（v2 已把 `FastMCP` 改名为 `MCPServer`，导入路径 `mcp.server.mcpserver`）。它是共享服务的 HTTP 客户端：导入/截图前用 `launcher.ensure_server()` 复用或拉起服务，其余全部走现有 API。
     - **stdout 是 MCP 协议，工具函数里绝不能 `print`**；需要日志只用 stderr / `launcher-server.log`。
     - 导出优先读 `GET /api/source/<id>` 的 `restore.images/layout`；`serializeLayout()` 已额外持久化 `binarize/noteColor/tolerance/softness`，让 MCP 能复现第 4 步的去色/反色。没有 restore 时才用 job captures 的默认裁剪。
     - 工具：`status` / `stop_server` / `import_bvid` / `open_tab` / `get_source` / `capture` / `get_job` / `detect_measures` / `auto_crop` / `export_score` / `history`。默认不自动打开浏览器（`open_browser=True` 才开）。
-    - 依赖是**可选的** `requirements-mcp.txt`（`-r requirements.txt` + `mcp>=2.0`）；不要加进核心 `requirements.txt`，也**尚未打进 exe**（MCP 入口目前走源码/venv）。
+    - 依赖是**可选的** `requirements-mcp.txt`（`-r requirements.txt` + `mcp>=2.0,<3`）；不要加进核心 `requirements.txt`，也**尚未打进 exe**（MCP 入口目前走源码/venv）。
 
 ## 常用命令
 

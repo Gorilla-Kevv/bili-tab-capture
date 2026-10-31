@@ -44,6 +44,7 @@ REM so --collect-all is required; fitz is its legacy alias module.
     --collect-submodules "curl_cffi" ^
     --collect-submodules "qrcode" ^
     --hidden-import "qrcode" ^
+    --hidden-import "launcher" ^
     --collect-all "pymupdf" ^
     --collect-all "fitz" ^
     app.py || goto :error

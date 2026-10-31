@@ -54,6 +54,7 @@ mkdir -p build/.pyinstaller
     --collect-submodules "curl_cffi" \
     --collect-submodules "qrcode" \
     --hidden-import "qrcode" \
+    --hidden-import "launcher" \
     --collect-all "pymupdf" \
     --collect-all "fitz" \
     app.py

@@ -4,13 +4,12 @@ import io
 import json
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
-import os
-import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -213,6 +212,36 @@ app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 SOURCES: Dict[str, Dict[str, Any]] = {}
 JOBS: Dict[str, Dict[str, Any]] = {}
 STORE_LOCK = threading.Lock()
+
+# 同一个缓存目录（同一个 BV）的下载串行化：并发导入同一 BV 时不能两个线程
+# 同时往 video.m4s 里写。不同 BV 的目录不同，互不影响。
+DOWNLOAD_LOCKS: Dict[str, threading.Lock] = {}
+DOWNLOAD_LOCKS_GUARD = threading.Lock()
+
+
+def bilibili_download_lock(cache_dir: Path) -> threading.Lock:
+    key = str(cache_dir.resolve())
+    with DOWNLOAD_LOCKS_GUARD:
+        lock = DOWNLOAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            DOWNLOAD_LOCKS[key] = lock
+        return lock
+
+
+def cached_bilibili_video(cache_dir: Path, key: str) -> Optional[Path]:
+    """只认下载完成后的成品文件（重命名成 BVxxx.*），不把下载中的 video.m4s 当缓存。
+
+    下载器先写 `video.m4s` 再重命名；并发导入若看到半截的 video.m4s 会误判“已下好”。
+    """
+    for ext in (".m4s", ".mp4"):
+        p = cache_dir / f"{key}{ext}"
+        if p.exists() and p.stat().st_size > 0:
+            return p
+    fallback = find_video_file(cache_dir)
+    if fallback is not None and fallback.name.lower() not in ("video.m4s", "video.mp4"):
+        return fallback
+    return None
 
 BILIBILI_LOGIN_LOCK = threading.Lock()
 BILIBILI_LOGIN: Dict[str, Any] = {"status": "idle", "qr": None, "message": None}
@@ -820,7 +849,8 @@ def index():
 
 @app.get("/api/version")
 def api_version():
-    return jsonify({"version": APP_VERSION})
+    # app 标识用于启动器识别“这个端口上是不是 BiliTabCapture”（端口可能被别的程序占着）。
+    return jsonify({"app": "BiliTabCapture", "version": APP_VERSION})
 
 
 SKIPPED_VERSION_FILE = CACHE_DIR / "skipped_version.txt"
@@ -853,24 +883,34 @@ def api_set_skipped_version():
 
 def run_bilibili_download(source_id: str, url: str, cache_dir: Path, bvid: str) -> None:
     """Background Bilibili download started at import time."""
-    try:
-        # 顺带下音频轨：导出 psz 要拿它当伴奏（制谱用不到，但包里有它才有意义）。
-        path = download_bilibili_video(url, cache_dir, with_audio=True)
-        # 统一按 BV 命名(保留实际后缀 .mp4/.m4s)，避免标题的非法字符作文件名。
-        target = cache_dir / (f"{bvid}" + Path(path).suffix.lower())
-        if path.resolve() != target.resolve():
-            shutil.move(str(path), str(target))
-        path = target
-        with STORE_LOCK:
-            src = SOURCES.get(source_id)
-            if src:
-                src["video_path"] = str(path)
-                src["download"] = {"status": "done", "message": None}
-    except Exception as exc:
-        with STORE_LOCK:
-            src = SOURCES.get(source_id)
-            if src:
-                src["download"] = {"status": "error", "message": str(exc)}
+    with bilibili_download_lock(cache_dir):
+        try:
+            # 另一个并发导入可能已经下完并重命名了，直接复用。
+            existing = cached_bilibili_video(cache_dir, bvid)
+            if existing is not None:
+                with STORE_LOCK:
+                    src = SOURCES.get(source_id)
+                    if src:
+                        src["video_path"] = str(existing)
+                        src["download"] = {"status": "done", "message": None}
+                return
+            # 顺带下音频轨：导出 psz 要拿它当伴奏（制谱用不到，但包里有它才有意义）。
+            path = download_bilibili_video(url, cache_dir, with_audio=True)
+            # 统一按 BV 命名(保留实际后缀 .mp4/.m4s)，避免标题的非法字符作文件名。
+            target = cache_dir / (f"{bvid}" + Path(path).suffix.lower())
+            if path.resolve() != target.resolve():
+                shutil.move(str(path), str(target))
+            path = target
+            with STORE_LOCK:
+                src = SOURCES.get(source_id)
+                if src:
+                    src["video_path"] = str(path)
+                    src["download"] = {"status": "done", "message": None}
+        except Exception as exc:
+            with STORE_LOCK:
+                src = SOURCES.get(source_id)
+                if src:
+                    src["download"] = {"status": "error", "message": str(exc)}
 
 
 def make_cached_job(source_id: str, cache_dir: Path, state: Dict[str, Any]) -> str:
@@ -967,7 +1007,7 @@ def import_source():
                 "download": {"status": "idle", "message": None},
             }
             state = load_state_json(cache_dir)
-            cached_video = find_video_file(cache_dir)
+            cached_video = cached_bilibili_video(cache_dir, bvid_id or f"av{aid}")
             has_img = _has_images(cache_dir, state)
             has_par = _has_params(state)
             if has_img or has_par:
@@ -1403,13 +1443,13 @@ def _bilibili_real_cover(key: str) -> Optional[bytes]:
     try:
         import bili as _bili
         url = "https://api.bilibili.com/x/web-interface/view?bvid=" + key
-        r = _bili._session.get(url, timeout=8)
+        r = _bili.bili_get(url, timeout=8)
         r.raise_for_status()
         pic = (r.json().get("data") or {}).get("pic")
         if not pic:
             return None
-        pr = _bili._session.get(pic, timeout=8,
-                                headers={"Referer": "https://www.bilibili.com/"})
+        pr = _bili.bili_get(pic, timeout=8,
+                            headers={"Referer": "https://www.bilibili.com/"})
         pr.raise_for_status()
         content = pr.content
         if content:
@@ -1501,8 +1541,7 @@ def api_history_restore():
 
     source_id = uuid.uuid4().hex
     if kind == "bilibili":
-        fid = next((p for p in cache_dir.iterdir()
-                    if p.is_file() and p.name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4s"))), None)
+        fid = cached_bilibili_video(cache_dir, safe_key)
         try:
             dl = get_video_duration(fid) if fid is not None else None
         except Exception:
@@ -2574,6 +2613,16 @@ def source_image(source_id: str):
     return send_file(source["path"])
 
 
+@app.get("/api/source/<source_id>")
+def source_instance(source_id: str):
+    """按 source_id 取回完整 source（启动器用 `?source=<id>` 让页面接手导入结果）。"""
+    with STORE_LOCK:
+        source = SOURCES.get(source_id)
+    if source is None:
+        return json_error("未知的视频源。", 404)
+    return jsonify(source)
+
+
 @app.get("/api/source_info/<source_id>")
 def source_info(source_id: str):
     """源的补充信息：PDF 的页数 / 当前 DPI（前端翻页与 DPI 输入框用）。"""
@@ -2727,42 +2776,8 @@ def preview_file(filename: str):
 
 
 if __name__ == "__main__":
-    ensure_cache_dirs()
-    # 删除“孤儿”中间产物：某 job/source 生命周期已结束即不再需要(bv/local/img 持久缓存不受影响)
-    try:
-        n = cleanup_orphan_transient()
-        if n:
-            print(f"已清理 {n} 个已结束 job/source 的中间产物目录。")
-    except Exception:
-        pass
+    # 启动逻辑在 launcher.py：无参数 = 原来的前台服务；--bvid = 起/复用服务并自动导入。
+    import launcher
 
-    def _port_free(p: int) -> bool:
-        import socket as _socket
-
-        with contextlib.closing(_socket.socket()) as s:
-            s.settimeout(0.5)
-            try:
-                s.bind(("127.0.0.1", p))
-                return True
-            except OSError:
-                return False
-
-    # 默认 5000 常被 macOS AirPlay 接收器占用；若被占用则自动改用下一个空闲端口，
-    # 避免一启动就报 “Address already in use” 直接退出（表现为“打不开/运行不了”）。
-    requested = int(os.environ.get("PORT", "5000"))
-    port = requested
-    if not _port_free(port):
-        for candidate in range(requested + 1, requested + 30):
-            if _port_free(candidate):
-                port = candidate
-                break
-        else:
-            pass  # 都不空闲则交给 Flask 报错
-    if port != requested:
-        print(f"端口 {requested} 被占用，已自动改用端口 {port}。")
-
-    url = f"http://127.0.0.1:{port}"
-    if not os.environ.get("BTAB_NO_BROWSER"):
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    print(f"服务器已启动：{url}")
-    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
+    entry = None if getattr(sys, "frozen", False) else Path(__file__).resolve()
+    raise SystemExit(launcher.main(sys.modules[__name__], entry))

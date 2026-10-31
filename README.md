@@ -31,6 +31,7 @@
 - 导出为长图
 - 自动识别小节线
 - 自动裁剪去重
+- 支持命令行按 BV 自动导入（供 agent / 脚本批量派发）
 
 ## 声明
 
@@ -54,6 +55,17 @@ pip install -r requirements.txt
 ```bash
 python app.py
 ```
+
+## 命令行自动导入（供 agent / 脚本使用）
+
+```bash
+python app.py --bvid BV1xx411c7mD
+```
+
+- 会先复用已经运行的本地服务；没有就在后台拉起一个（端口与 pid 记录在 `BiliTabCapture_cache/server.json`）。
+- 自动导入指定 BV，并在浏览器打开对应页面；后续裁剪、排版、导出仍在网页里手动完成。
+- 支持多个 `--bvid`；`--wait 300` 可等待视频下载完成后再退出；`--new-instance` 强制新开一个服务。
+- 打包后的 `BiliTabCapture.exe` 使用相同参数（需要重新打包才会包含该功能）。
 
 ## 打包
 

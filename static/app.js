@@ -4309,3 +4309,18 @@ function setPreviewQnBadge(qn) {
   badge.textContent = label;
   badge.classList.remove('hidden');
 }
+
+/* ===================== 启动器自动接管 ===================== */
+// 启动器以 /?source=<id> 打开页面：直接接管已导入的源（下载中的会继续显示进度）。
+(async function openSourceFromQuery() {
+  const params = new URLSearchParams(location.search);
+  const sourceId = (params.get("source") || "").trim();
+  if (!sourceId) return;
+  // 保留 URL 参数：刷新/浏览器重启后还能按 source_id 重新接管（下载中的会继续轮询）。
+  try {
+    const source = await fetchJson(`/api/source/${encodeURIComponent(sourceId)}`);
+    applySource(source);
+  } catch (error) {
+    setStatus(els.importStatus, error.message, "error");
+  }
+})();

@@ -13,6 +13,7 @@
 BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / 本地视频 / 图片 / PDF）转换为 PDF/长图的工具，主要用于制谱截图。
 
 - 后端：Flask 本地 Web 服务（`app.py`），默认 `http://127.0.0.1:5000`，启动后自动开浏览器。
+- 启动器：`launcher.py`。`python app.py` / 双击 exe = 原来的前台服务；`python app.py --bvid BV…` = 复用/后台拉起常驻服务、自动导入并打开对应标签页（供 agent/脚本调用，见「关键约定」第 20 条）。
 - 前端：`templates/index.html` + `static/app.js` + `static/styles.css`（原生 JS，无框架）。
 - 流程四步：**导入 → 截图(第2步) → 调整裁剪/小节线(第3步) → 排版导出(第4步)**。
   第 4 步导出 PDF / 长图 / **`.psz`**（`.psz` 是 PDF Score 的谱面包，见下面「关键约定」第 18 条）。
@@ -25,6 +26,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 | 文件 | 职责 |
 | --- | --- |
 | `app.py` | Flask 服务与全部 HTTP 路由；任务(Job)/源(Source)内存管理；缓存与历史记录；PDF/长图/psz 导出。 |
+| `launcher.py` | **启动/并发入口**：`--bvid` 快捷启动（发现/复用常驻服务，或 detached 拉起一个；经 HTTP 调 `/api/import`，再打开 `/?source=<id>`，最后输出 JSON）；`--serve` 是真正的前台服务实现（独占端口、写 `server.json`、并发锁）。 |
 | `tab_extractor.py` | 视频抽帧、去重、裁剪、小节线识别、长图/PDF 绘制；**同时也可作为独立 CLI** (`python tab_extractor.py <url/文件>`)。`build_pdf_from_images` 的 `geometry` 出参与 `build_score_meta` 负责 psz 的排版几何 → `score.json`。 |
 | `bili.py` | 哔哩哔哩扫码登录(二维码)与视频下载。**所有平台统一走这里**，不使用 `bilix.exe`/yt-dlp。同时是**所有 B 站 HTTP 请求的唯一出口**：`bili_get()` / `get_json()` / `resolve_short_url()`（curl_cffi 浏览器指纹 + 主页热身 + 412 降级，见「关键约定」第 19 条）。 |
 | `pdf_render.py` | **PDF 渲染**：`render_pdf_pages` 批量逐页渲染、`render_pdf_page` 单页渲染、`pdf_page_count` 探页数、`clamp_dpi` 收敛 DPI（50–600，默认 200）。依赖 PyMuPDF，**延迟导入**——缺依赖时只有真正导入 PDF 才报错，视频/图片不受影响。 |
@@ -63,7 +65,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 6. **第 2 步参数提前持久化**：截图参数（起止时间、采样间隔、差异阈值、条带半宽、比较窗口、去色容差/平滑、抽帧前裁剪框 `crop*`）通过 `POST /api/save_capture_prefs` 存进 `state.json` 的 `params2`（改动即存、防抖）。读取时 `read_capture_prefs()` 会为缺失字段**回退默认值以兼容旧版缓存**。
 7. **“从新开始”（命中弹窗）会删除整个缓存目录**（`/api/cache_clear` + `full:true`）：之后必须避免继续引用已删除的文件（B 站会重新导入下载，本地/图片则回到第 1 步让用户重选）。
 8. **中文标题字体**：PDF/长图的标题渲染依赖跨平台 CJK 字体查找（`tab_extractor.load_font`）。修改字体逻辑要保证 macOS（Hiragino/Songti/STHeiti）与 Windows（msyh 等）都能命中，否则中文会变“豆腐块”。
-9. **端口被占自动顺延**：`app.py` 的 `__main__` 会在 5000 被占（macOS AirPlay）时自动换端口；`BTAB_NO_BROWSER=1` 可禁止自动开浏览器。
+9. **端口被占自动顺延**：启动逻辑已移到 `launcher.py`：5000 被占（macOS AirPlay / 另一个实例）时按 5001、5002… 顺延，`--port 0` 交给系统分配；`BTAB_NO_BROWSER=1` 可禁止自动开浏览器。
 10. **更新检查走后端代理**：浏览器直连 Gitee API 会 403/CORS。前端只请求同源 `GET /api/latest_version`（后端依次尝试 Gitee tags → GitHub releases）。
 11. **PDF 与图片共用卡片逻辑**：`app.IMAGE_LIKE_TYPES = {"image", "pdf"}`。凡是判断“非视频源”，**必须用 `IMAGE_LIKE_TYPES` 而不是 `== "image"`**（如 `/api/captures` 分流、`/api/source_image`）。漏掉会导致 PDF 走视频抽帧分支直接报错。前端对应的是 `state.sourceType`。
 12. **第 2 步时间轴是双单位的**：视频按「秒」、PDF 按「页」，共用同一条轨道/把手/进度条。前端用 `state.timeUnit`（`"sec"`/`"page"`）与 `isPageMode()` 切换，取值走 `currentStartTime()/currentEndTime()`，换算走 `timeToRatio()/ratioToTime()`。页模式用 `(page-1)/(total-1)` 让首尾页贴住两端。**新增第 2 步参数要同步 `STEP2_PARAM_IDS` + `collectStep2Params()` + `applyStep2Params()`**，否则改动不会持久化。
@@ -89,6 +91,19 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
     这三者内部负责 `impersonate` + 首次主页热身（拿 `buvid3`/`b_nut`）+ 412 时「登录态 → 游客态并重新热身」降级重试。**新增任何 B 站接口调用都必须接进这套入口**；`tab_extractor.py` 里那个 urllib 的 `_NO_PROXY_OPENER` 现在没有调用方，**别再拿它去请求 B 站**（`_resolve_url` / `_bilibili_api_json` 就是踩了这个坑）。
     - **412 ≠ 区域限制**：番剧/版权视频被墙返回的是 `-10403 您所在地区不可观看`（或 404），那只能挂代理，改代码没用。
     - `curl_cffi` 的 session 默认 `trust_env=True`，会读 `http_proxy` / `https_proxy` 环境变量；原来那两处 urllib 是显式跳过系统代理的，环境变量代理的机器上行为会有这点差异。
+20. **agent 快捷启动（`--bvid`）**：`app.py` 的 `__main__` 现在只负责委托给 `launcher.main()`。`--bvid` **不是在前台起服务**：
+    - 先读 `BiliTabCapture_cache/server.json`，`GET /api/version` 返回 `app: "BiliTabCapture"` 就复用；否则只快速探测 5000–5002，仍没有才 detached 拉起 `--serve`（用唯一 `--info-file` 回传实际端口，避免与 canonical 文件抢写）。
+    - 发现/拉起用 `BiliTabCapture_cache/launcher.lock` 串行化，多个 agent 并发调用只会起一个服务；不同 BV 的导入/下载在同一个服务里并行。
+    - 导入在服务端完成（`POST /api/import`，form 字段 `bvid`），随后打开 `/?source=<source_id>`；前端 `openSourceFromQuery()` 调 `GET /api/source/<id>` 后 `applySource()`。**`source` 参数故意保留在 URL 上**，刷新/浏览器重启后还能恢复同一个源。
+    - stdout 只输出 JSON（`ensure_ascii=True`，避免 Windows GBK 把中文变成乱码）；退出码 0=全部成功、1=有 BV 导入失败。`--wait N` 会先把所有 BV 导入完，再统一等下载。日志在 `BiliTabCapture_cache/launcher-server.log`。
+    - **服务是 detached 的**（没有窗口可关）：要停就结束 `server.json` 里的 `pid`；删 `server.json` 停不了服务（默认端口段内的实例下次仍会被探测复用）。没有 `app` 标识的旧版服务不会被复用。
+    - 打包脚本已加 `--hidden-import launcher`；**改完必须重新打包**，旧 exe 不认 `--bvid`。
+21. **并发相关的几个硬点**：
+    - **端口必须独占**：Windows 的 `SO_REUSEADDR` 允许两个进程同时监听同一端口（实测两个实例都能 bind 5000，请求随机落到其中一个）。`launcher.serve()` 用 `allow_reuse_address = False` 的 `ThreadedWSGIServer` 子类；werkzeug bind 失败走的是 `sys.exit(1)`，必须接住 `SystemExit` 才能继续试下一个端口。**不要改回 `app.run` / `make_server` 的默认值**。
+    - **启动前不要全端口段扫描**：`serve()` 里曾为“判断是否还有别的实例”而探测 5000–5029，遇到不响应的端口会让首个服务 30 秒才就绪；等待方把**活锁**当过期，结果重复起了两个服务（实测复现）。现在只探测 canonical + 5000–5002，且 `_LaunchLock` 会检查锁文件里的 owner pid（活着就不抢，死了立即回收），不再只靠 mtime。
+    - **B 站请求线程隔离**：`bili.py` 用 `threading.local()` 的 `_get_session()`；**不要再引入模块级共享 `Session`**（多标签并发导入/下载会共用同一个 curl handle）。Cookie 仍然逐请求显式传。
+    - **同一个 BV 只下载一次**：`bilibili_download_lock()` 按缓存目录串行化；`cached_bilibili_video()` 只认下载完成后重命名的 `BVxxx.*`，**不要把下载中的 `video.m4s` / `video.mp4` 当缓存**（并发导入会误判“已下好”）。新增下载命名方式时两处都要同步。
+    - 另外：`launcher.serve()` 在启动清理前会探测是否已有实例在跑，有就跳过 `cleanup_orphan_transient()`，否则会删掉别的实例的 `runs/`、`previews/`。
 
 ## 常用命令
 
@@ -98,6 +113,13 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt      # Windows: .venv\Scripts\pip
 .venv/bin/python app.py                         # 打开 http://127.0.0.1:5000
 
+# agent 快捷启动：复用/拉起常驻服务，自动导入并打开标签页（--bvid 可重复）
+.venv/bin/python app.py --bvid BV1xx411c7mD
+.venv/bin/python app.py --bvid BV1... --bvid BV2... --wait 300
+
+# 常驻服务是 detached 的，停止请结束 BiliTabCapture_cache/server.json 里的 pid
+# （Windows: Stop-Process -Id <pid>）
+
 # 仅当参数解析/抽帧算法改动时，用 CLI 快速验证
 .venv/bin/python tab_extractor.py "<BV号或本地文件>" --output out.pdf
 
@@ -106,7 +128,7 @@ build_exe.bat        # Windows → dist/BiliTabCapture.exe
 bash build_mac.sh    # macOS   → dist/BiliTabCapture_mac
 
 # 语法自检（无需运行 GUI）
-.venv/bin/python -m py_compile app.py tab_extractor.py bili.py runtime_paths.py pdf_render.py
+.venv/bin/python -m py_compile app.py launcher.py tab_extractor.py bili.py runtime_paths.py pdf_render.py
 node --check static/app.js
 
 # 造一个多页测试 PDF（不需要任何外部工具）
@@ -122,6 +144,7 @@ ps[0].save('/tmp/t.pdf', save_all=True, append_images=ps[1:])"
 - 改前端：`static/app.js` 顶部有 `els`（DOM 引用）与 `els` 之外的 `state`；新增 UI 记得在 `index.html` 加元素、在 `els` 注册，样式追加到 `styles.css` 末尾并复用主题变量（`--accent` / `--accent-weak` / `--accent-strong` / `--line` / `--input-bg` / `--muted` 等）。
 - 图标：优先放 `static/icons/<name>.svg` 并在 `loadIcons()` 的映射中登记，不要在 JS 里内联大段 SVG（除非占位回退）。
 - 依赖：保持精简（现为 Flask / numpy / opencv-python / Pillow / curl_cffi / qrcode / **pymupdf**）。**不要引入 ffmpeg 或新的重型依赖**，除非明确讨论过。
+- **启动/并发改动**：`app.py` 的 `__main__` 只委托 `launcher.main()`；新增启动参数放 `launcher.main()` 的 argparse，不要再恢复 `app.py` 里旧的 `_port_free` / `app.run` 逻辑。前端 `?source=` 参数要保留（刷新恢复依赖它）。
 - **无头验证后端**：Flask 自带 `app.test_client()` 就能把整条链路跑通（导入→预览→生成截图→导出 PDF），不必开浏览器。记得 `BTAB_NO_BROWSER=1`，跑完清掉 `BiliTabCapture_cache/` 里的测试残留。
 
 ## 验证要求
@@ -131,4 +154,6 @@ ps[0].save('/tmp/t.pdf', save_all=True, append_images=ps[1:])"
 - 涉及缓存/历史：确认持久缓存 `bv/local/img/pdf` 不被误删，中间产物可被清理。
 - 涉及 PDF：确认导入能拿到页数、改 DPI 会整体重渲、页码区间能正确产出对应页数的卡片。
 - 涉及 psz：`POST /api/psz` 后把包读回来，确认条目**都在根目录** —— 多一个子目录就会在 PDF Score 那边变成两张乐谱；再对一遍四条分支：有小节线→`score.json` 带 `pages`；每行一个小节且无音频→**没有** `score.json`；每行一个小节但有音频→`score.json` 在且 `pages` 为空数组。带 `score.json` 且 `pages` 非空时，还要确认 `pages` 的张数、页面尺寸与 PDF 实际的页数、MediaBox 一致（PDF Score 会拿 PDF 的真实值覆盖它们）。
+- 涉及启动器/并发：确认无服务时能 detached 拉起、有服务时返回 `reused: true`、两个启动器并发只起一个服务；端口被占能顺延到 5001；`?source=` 页面能进第 2 步且刷新后仍能恢复；同一个 BV 并发导入只下载一次（可 mock `download_bilibili_video` 验证调用次数）。
+- 涉及打包：重新执行 `build_exe.bat` / `build_mac.sh` 后，至少确认 `--bvid` 可用；未重新打包要明确说明“旧 exe 不包含该功能”。
 - 无浏览器自动化环境时，明确说明“未运行 GUI，需人工点验”。

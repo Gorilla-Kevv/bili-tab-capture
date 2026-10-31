@@ -26,3 +26,5 @@ BiliTabCapture_cache/
 build/
 dist/
 *.spec
+# 根目录手动放的单文件构建产物（真正的产物在 dist/）
+BiliTabCapture.exe

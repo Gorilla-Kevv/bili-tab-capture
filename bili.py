@@ -8,6 +8,7 @@ import base64
 import io
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -26,7 +27,17 @@ _BASE_HEADERS = {
     "Origin": "https://www.bilibili.com",
 }
 
-_session = curl_requests.Session(headers=_BASE_HEADERS, impersonate="chrome124")
+# 每个线程一个会话：多标签页并发导入/下载时不能共用同一个 curl handle。
+# Cookie 始终按请求显式传入（见 _session_headers），所以线程间不需要共享会话状态。
+_sessions = threading.local()
+
+
+def _get_session() -> "curl_requests.Session":
+    session = getattr(_sessions, "session", None)
+    if session is None:
+        session = curl_requests.Session(headers=_BASE_HEADERS, impersonate="chrome124")
+        _sessions.session = session
+    return session
 
 # 单文件 MP4 流的可尝试清晰度（qn），从高到低。未登录时 B 站会自动降到可用档。
 _FALLBACK_QN = (116, 112, 80, 64, 32, 16)
@@ -62,7 +73,7 @@ def qrcode_login_generate() -> "tuple[str, str]":
         "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
         "?source=main-fe-header&go_url=https:%2F%2Fwww.bilibili.com%2F&web_location=333.1007"
     )
-    resp = _session.get(url, timeout=15)
+    resp = _get_session().get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()["data"]
 
@@ -81,13 +92,13 @@ def qrcode_login_poll(qrcode_key: str, timeout: float = 180.0, interval: float =
     )
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resp = _session.get(url, timeout=15)
+        resp = _get_session().get(url, timeout=15)
         resp.raise_for_status()
         body = resp.json()["data"]
         code = body["code"]
 
         if code == 0:
-            cookie_str = "; ".join(f"{k}={v}" for k, v in _session.cookies.items())
+            cookie_str = "; ".join(f"{k}={v}" for k, v in _get_session().cookies.items())
             if not cookie_str:
                 raise RuntimeError("登录成功但未获取到 Cookie，请重试。")
             return cookie_str
@@ -114,8 +125,6 @@ def _session_headers(url: str, cookie: Optional[str]) -> dict:
 # 换成 curl_cffi 的 impersonate 立刻 200）。海外 / 机房 IP 的判定阈值更低，
 # 所以海外用户"一导入就 412"。本模块统一走下面的入口，避免各处各写一套。
 
-_warmed_up = False
-
 _RISK_CONTROL_HINT = (
     "B 站风控拦截(HTTP 412)：当前网络环境被判定为异常请求，常见于海外或机房 IP。"
     "已自动降级重试仍失败，请稍后重试或更换网络。"
@@ -128,12 +137,13 @@ def warm_up(force: bool = False) -> None:
     指纹问题由 `impersonate` 解决；这里再补一份 Cookie 画像，进一步降低被拦概率。
     失败不抛异常（只是少一层保险，不影响后续请求）。
     """
-    global _warmed_up
-    if _warmed_up and not force:
+    if getattr(_sessions, "warmed", False) and not force:
         return
-    _warmed_up = True
+    _sessions.warmed = True
     try:
-        _session.get("https://www.bilibili.com/", timeout=10, impersonate="chrome124")
+        _get_session().get(
+            "https://www.bilibili.com/", timeout=10, impersonate="chrome124"
+        )
     except Exception:
         pass
 
@@ -155,8 +165,8 @@ def bili_get(url: str, cookie: Optional[str] = None, timeout: float = 15,
             merged.update(headers)
         warm_up(force=force)
         try:
-            resp = _session.get(url, headers=merged, timeout=timeout,
-                                impersonate="chrome124")
+            resp = _get_session().get(url, headers=merged, timeout=timeout,
+                                      impersonate="chrome124")
         except Exception as exc:
             last_error = exc
             continue
@@ -211,8 +221,8 @@ def extract_bvid(url: str) -> str:
 def _probe_ok(url: str, headers: dict) -> bool:
     """试探该直链能否真正下到第一块(而非返回 4xx 放防盗页面)。"""
     try:
-        resp = _session.get(url, headers=headers, stream=True, timeout=12,
-                            impersonate="chrome124")
+        resp = _get_session().get(url, headers=headers, stream=True, timeout=12,
+                                  impersonate="chrome124")
         try:
             if resp.status_code != 200:
                 return False
@@ -255,8 +265,8 @@ def _find_durl(url: str, cid: int, cookie: Optional[str], quality: Optional[int]
 
 
 def _download_stream(url: str, headers: dict, dest: Path) -> None:
-    resp = _session.get(url, headers=headers, stream=True, timeout=30,
-                        impersonate="chrome124")
+    resp = _get_session().get(url, headers=headers, stream=True, timeout=30,
+                              impersonate="chrome124")
     resp.raise_for_status()
     with open(dest, "wb") as f:
         for chunk in resp.iter_content(chunk_size=1024 * 1024):

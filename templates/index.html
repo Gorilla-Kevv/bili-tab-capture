@@ -109,6 +109,20 @@
         </div>
       </div>
 
+      <div class="timeline timeline-main" id="timeline" aria-label="选择范围并查看任意帧"
+        title="拖动两端调整范围；点击或拖动轨道查看任意帧">
+        <div class="timeline-track" id="timelineTrack">
+          <div class="timeline-progress" id="timelineProgress"></div>
+          <div class="timeline-playhead" id="timelinePlayhead" aria-hidden="true"></div>
+        </div>
+        <button class="timeline-handle timeline-handle-start" id="timelineStartHandle" type="button"
+          aria-label="开始时间"></button>
+        <button class="timeline-handle timeline-handle-end" id="timelineEndHandle" type="button"
+          aria-label="结束时间"></button>
+        <span class="timeline-label timeline-label-start" id="timelineStartLabel">00:00</span>
+        <span class="timeline-label timeline-label-end" id="timelineEndLabel"></span>
+      </div>
+
       <details class="advanced" id="advancedSettings">
         <summary>高级设置</summary>
         <div class="form-grid advanced-grid">
@@ -139,18 +153,6 @@
                   <span>页</span>
                 </div>
               </div>
-            </div>
-
-            <div class="timeline" id="timeline" aria-label="选择开始和结束时间">
-              <div class="timeline-track" id="timelineTrack">
-                <div class="timeline-progress" id="timelineProgress"></div>
-              </div>
-              <button class="timeline-handle timeline-handle-start" id="timelineStartHandle" type="button"
-                aria-label="开始时间"></button>
-              <button class="timeline-handle timeline-handle-end" id="timelineEndHandle" type="button"
-                aria-label="结束时间"></button>
-              <span class="timeline-label timeline-label-start" id="timelineStartLabel">00:00</span>
-              <span class="timeline-label timeline-label-end" id="timelineEndLabel"></span>
             </div>
 
             <div class="field time-field" id="endTimeField">

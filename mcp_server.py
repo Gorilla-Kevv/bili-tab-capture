@@ -422,11 +422,92 @@ def detect_measures(
     }
 
 
+def _apply_stitch_to_images(
+    images: List[Dict[str, Any]], details: Dict[str, Any], hide_duplicates: bool
+) -> int:
+    """按 /api/stitch 的 details 更新裁剪并隐藏重复/被完全覆盖的截图。"""
+    seams = details.get("seams") or []
+    valid = details.get("valid") or []
+    duplicate = details.get("duplicate") or []
+    count = len(images)
+
+    for image in images:
+        if image.get("autoHidden"):
+            image["hidden"] = False
+            image["autoHidden"] = False
+        crop = dict(image.get("crop") or {})
+        crop["l"], crop["r"] = 0.0, 1.0
+        image["crop"] = crop
+
+    if hide_duplicates:
+        for index in range(count - 1):
+            if index >= len(duplicate) or not duplicate[index]:
+                continue
+            image = images[index + 1]
+            if not image.get("hidden"):
+                image["hidden"] = True
+                image["autoHidden"] = True
+            crop = dict(image.get("crop") or {})
+            crop["l"], crop["r"] = 0.0, 1.0
+            image["crop"] = crop
+
+    for index in range(count - 1):
+        if index >= len(valid) or not valid[index]:
+            continue
+        if index < len(duplicate) and duplicate[index]:
+            continue
+        seam = seams[index] if index < len(seams) else None
+        if not seam:
+            continue
+        left_img = images[index]
+        right_img = images[index + 1]
+        lc = dict(left_img.get("crop") or {})
+        rc = dict(right_img.get("crop") or {})
+        lc["r"] = max(0.0, min(1.0, _num(seam[0], 1.0)))
+        rc["l"] = max(0.0, min(1.0, _num(seam[1], 0.0)))
+        left_img["crop"], right_img["crop"] = lc, rc
+
+    if hide_duplicates:
+        for index in range(1, count - 1):
+            image = images[index]
+            if image.get("hidden") or image.get("autoHidden"):
+                continue
+            prev_valid = (
+                index - 1 < len(valid)
+                and valid[index - 1]
+                and not (index - 1 < len(duplicate) and duplicate[index - 1])
+            )
+            next_valid = (
+                index < len(valid)
+                and valid[index]
+                and not (index < len(duplicate) and duplicate[index])
+            )
+            crop = image.get("crop") or {}
+            if prev_valid and next_valid and _num(crop.get("r"), 1.0) - _num(crop.get("l"), 0.0) < 0.03:
+                image["hidden"] = True
+                image["autoHidden"] = True
+                crop = dict(crop)
+                crop["l"], crop["r"] = 0.0, 1.0
+                image["crop"] = crop
+
+    for image in images:
+        if image.get("autoHidden") or image.get("hidden"):
+            continue
+        crop = image.get("crop") or {}
+        if _num(crop.get("r"), 1.0) - _num(crop.get("l"), 0.0) < 0.02:
+            crop = dict(crop)
+            crop["l"], crop["r"] = 0.0, 1.0
+            image["crop"] = crop
+
+    return sum(1 for image in images if image.get("autoHidden"))
+
+
 @mcp.tool()
 def auto_crop(
     source_id: Optional[str] = None,
     job_id: Optional[str] = None,
     apply: bool = True,
+    hide_duplicates: bool = True,
     max_width: int = 600,
     coefficient_horizontal: float = 0.7,
     coefficient_vertical: float = 0.8,
@@ -434,7 +515,7 @@ def auto_crop(
     tolerance: float = 300.0,
     softness: float = 90.0,
 ) -> Dict[str, Any]:
-    """自动裁剪去重：按相邻截图的拼接缝调整左右裁剪框；apply=True 写回 state。"""
+    """自动裁剪去重：用拼接缝调整左右裁剪框，可选隐藏重复/被覆盖的截图。"""
     port = _existing_port()
     resolved_job = job_id
     if not resolved_job:
@@ -461,26 +542,24 @@ def auto_crop(
         payload["note_color"] = note_color
     data = _call(port, "POST", "/api/stitch", json_body=payload, timeout=120)
     seams = data.get("seams") or []
+    hidden = 0
     applied = 0
-    if apply and seams:
+    if apply:
         images, _layout, _meta = _images_for_job(
             port, source_id or job.get("source_id"), str(resolved_job)
         )
-        for index, image in enumerate(images):
-            crop = dict(image.get("crop") or {})
-            left = _num(crop.get("l"), 0.0)
-            right = _num(crop.get("r"), 1.0)
-            if index > 0 and index - 1 < len(seams):
-                left = max(0.0, min(1.0, _num(seams[index - 1][1], left)))
-            if index < len(images) - 1 and index < len(seams):
-                right = max(0.0, min(1.0, _num(seams[index][0], right)))
-            if right - left < 0.02:
-                left, right = 0.0, 1.0
-            crop["l"], crop["r"] = left, right
-            image["crop"] = crop
-            applied += 1
+        hidden = _apply_stitch_to_images(images, data, hide_duplicates)
         _save_images(port, str(resolved_job), images)
-    return {"job_id": resolved_job, "seams": seams, "applied": applied}
+        applied = len(images)
+    return {
+        "job_id": resolved_job,
+        "seams": seams,
+        "valid": data.get("valid") or [],
+        "duplicate": data.get("duplicate") or [],
+        "confidence": data.get("confidence") or [],
+        "applied": applied,
+        "hidden": hidden,
+    }
 
 
 @mcp.tool()

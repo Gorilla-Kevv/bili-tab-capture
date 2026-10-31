@@ -1704,6 +1704,326 @@ def _best_barline_seam(
     return (best[1], best[2])
 
 
+MIN_STITCH_CORRELATION = 0.55
+MIN_STITCH_NCC = 0.70  # 2D 内容相关性下限；低于此值不裁剪
+STITCH_BARLINE_TOLERANCE = 0.02  # 位移与“小节线对”最大允许偏差（归一化）
+DUPLICATE_NCC = 0.99  # 零位移下几乎完全相同
+DUPLICATE_MAX_SHIFT_RATIO = 0.01  # 位移小于宽度的 1% 也按重复处理
+
+
+def _stitch_column_profile(image: Image.Image) -> np.ndarray:
+    """列墨迹强度（去掉中位背景、标准化），用于估计相邻截图的水平位移。
+
+    黑底白字和白底黑字都取“相对背景的绝对偏差”，不依赖极性。
+    """
+    gray = np.asarray(ImageOps.grayscale(image), dtype=np.float32)
+    height, width = gray.shape
+    if height < 4 or width < 8:
+        return np.zeros(max(width, 1), dtype=np.float32)
+    top = int(height * 0.08)
+    bottom = max(top + 1, int(height * 0.92))
+    band = gray[top:bottom, :]
+    baseline = float(np.median(band))
+    profile = np.abs(band - baseline).mean(axis=0)
+    profile -= profile.mean()
+    std = float(profile.std())
+    return profile / std if std > 1e-6 else np.zeros_like(profile)
+
+
+def _profile_correlations(
+    profile_a: np.ndarray, profile_b: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """一次性算出所有水平位移下的局部归一化相关（前缀和 + np.correlate）。
+
+    与逐 shift 做 mean/norm/dot 的结果一致，但把 Python 循环换成了 C 层计算。
+    返回 (shifts, correlations)；shift 为 0..width-1。
+    """
+    width = min(profile_a.size, profile_b.size)
+    if width < 32:
+        return np.asarray([], dtype=np.int64), np.asarray([], dtype=np.float64)
+    a = profile_a[:width].astype(np.float64)
+    b = profile_b[:width].astype(np.float64)
+    prefix_a = np.concatenate(([0.0], np.cumsum(a)))
+    prefix_a2 = np.concatenate(([0.0], np.cumsum(a * a)))
+    prefix_b = np.concatenate(([0.0], np.cumsum(b)))
+    prefix_b2 = np.concatenate(([0.0], np.cumsum(b * b)))
+    cross = np.correlate(a, b, mode="full")[width - 1: 2 * width - 1]
+    shifts = np.arange(0, width, dtype=np.int64)
+    overlap = width - shifts
+    min_overlap = max(16, int(width * 0.08))
+    keep = overlap >= min_overlap
+    shifts = shifts[keep]
+    overlap = overlap[keep]
+    sum_a = prefix_a[width] - prefix_a[shifts]
+    sum_a2 = prefix_a2[width] - prefix_a2[shifts]
+    sum_b = prefix_b[overlap]
+    sum_b2 = prefix_b2[overlap]
+    dot = cross[shifts]
+    numerator = dot - (sum_a * sum_b) / overlap
+    var_a = sum_a2 - (sum_a * sum_a) / overlap
+    var_b = sum_b2 - (sum_b * sum_b) / overlap
+    denominator = np.sqrt(np.maximum(var_a, 0.0) * np.maximum(var_b, 0.0))
+    correlations = np.full(shifts.shape, -2.0, dtype=np.float64)
+    good = denominator > 1e-9
+    correlations[good] = numerator[good] / denominator[good]
+    return shifts, correlations
+
+
+def _stitch_profile_candidates(
+    profile_a: np.ndarray, profile_b: np.ndarray, limit: int = 24
+) -> List[Tuple[float, int, int]]:
+    """列剖面相关性的候选位移 [(corr, shift, overlap)]。
+
+    小节线周期会让多个 shift（例如 80/160/240px）都得到近乎相同的分数；
+    这里只做候选，最终由 2D 内容相关性裁决。
+    """
+    width = min(profile_a.size, profile_b.size)
+    shifts, correlations = _profile_correlations(profile_a, profile_b)
+    if shifts.size == 0:
+        return []
+    order = np.argsort(correlations)[::-1]
+    chosen: List[Tuple[float, int, int]] = []
+    used_shifts: List[int] = []
+    for index in order:
+        shift = int(shifts[index])
+        if shift < 1 or correlations[index] <= -1.5:
+            continue
+        if any(abs(shift - other) < 2 for other in used_shifts):
+            continue
+        chosen.append((float(correlations[index]), shift, width - shift))
+        used_shifts.append(shift)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def _ncc_2d(gray_a: np.ndarray, gray_b: np.ndarray, shift: int) -> float:
+    """两张灰度图在水平位移 shift 下的归一化互相关（重叠区域）。"""
+    height = min(gray_a.shape[0], gray_b.shape[0])
+    width = min(gray_a.shape[1], gray_b.shape[1])
+    if height < 2 or width < 8 or shift < 0 or shift >= width - 1:
+        return -1.0
+    a = gray_a[:height, shift:width].astype(np.float64)
+    b = gray_b[:height, : width - shift].astype(np.float64)
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = float(np.sqrt(np.sum(a * a) * np.sum(b * b)))
+    if denom <= 1e-9:
+        return -1.0
+    return float(np.sum(a * b) / denom)
+
+
+def _notes_only_gray(
+    image: Image.Image,
+    bars: List[int],
+    coefficient_horizontal: float,
+    max_width: int,
+) -> np.ndarray:
+    """去掉谱表横线和竖小节线后的灰度图（保留音符/数字），用于位移裁决。
+
+    小节线有周期性，会让“多一小节”的位移也得到很高相关性；音符内容能区分它们。
+    """
+    gray = np.array(ImageOps.grayscale(image), dtype=np.uint8)
+    height, width = gray.shape
+    if height < 4 or width < 8:
+        return np.asarray(gray, dtype=np.float32)
+    mask = np.zeros_like(gray, dtype=bool)
+    for x in bars:
+        mask[:, max(0, x - 4):min(width, x + 5)] = True
+    # 快速找谱表横线：整行大部分是墨迹的行（比再做一次完整线段检测便宜很多）。
+    ink = gray > 160 if float(gray.mean()) < 128 else gray < 95
+    row_ratio = ink.mean(axis=1)
+    mask[row_ratio >= 0.25, :] = True
+    background = (
+        float(np.median(gray[~mask])) if np.any(~mask) else float(np.median(gray))
+    )
+    out = gray.astype(np.float32)
+    out[mask] = background
+    if out.shape[1] > max_width:
+        out = cv2.resize(
+            out,
+            (
+                max_width,
+                max(1, int(round(out.shape[0] * max_width / out.shape[1]))),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+    return out
+
+
+def _mean_abs_diff(gray_a: np.ndarray, gray_b: np.ndarray) -> float:
+    height = min(gray_a.shape[0], gray_b.shape[0])
+    width = min(gray_a.shape[1], gray_b.shape[1])
+    if height < 2 or width < 8:
+        return 255.0
+    return float(
+        np.mean(
+            np.abs(
+                gray_a[:height, :width].astype(np.float32)
+                - gray_b[:height, :width].astype(np.float32)
+            )
+        )
+    )
+
+
+def _snap_stitch_seam(
+    shift: int,
+    bars_a: List[int],
+    bars_b: List[int],
+    width_a: int,
+    width_b: int,
+) -> Tuple[Tuple[float, float], bool]:
+    """把水平位移吸附到“同一根小节线”上，返回 ((右_a, 左_b), snapped)。
+
+    位移 shift 表示 a 的内容在 b 中左移了 shift 像素；同一根小节线满足
+    x_a - x_b = shift。取共享区内最靠左的一根（a 的第一个可用切口），
+    这样 a 保留尽量少、b 保留尽量多，避免不同截图切法来回跳。
+    """
+    tolerance = max(6.0, STITCH_BARLINE_TOLERANCE * max(width_a, width_b))
+    candidates: List[Tuple[int, int, float]] = []
+    if not bars_a or not bars_b:
+        left_b = (width_a - shift) / width_b
+        return (
+            shift / width_a,
+            max(0.0, min(1.0, left_b)),
+        ), False
+    for x_a in bars_a:
+        x_b = x_a - shift
+        if x_b < 0 or x_b >= width_b:
+            continue
+        nearest = min(bars_b, key=lambda x: abs(x - x_b))
+        delta = abs(nearest - x_b)
+        if delta <= tolerance:
+            candidates.append((x_a, nearest, delta))
+    if candidates:
+        x_a, x_b, _ = min(candidates, key=lambda item: item[0])
+        return (x_a / width_a, x_b / width_b), True
+    left_b = (width_a - shift) / width_b
+    return (
+        shift / width_a,
+        max(0.0, min(1.0, left_b)),
+    ), False
+
+
+def compute_stitch_details(
+    images: List[Image.Image],
+    max_width: int = 600,
+    coefficient_horizontal: float = 0.7,
+    coefficient_vertical: float = 0.8,
+    note_rgb: Optional[Tuple[int, int, int]] = None,
+    tolerance: float = 300.0,
+    softness: float = 90.0,
+) -> Dict[str, Any]:
+    """相邻截图拼接缝 + 置信度/是否吸附小节线/是否几乎重复。
+
+    seams[i] = (right_of_left, left_of_right)：左图右边界、右图左边界。
+    valid=False 表示这一对没有可靠重叠（低置信度），前端应保持整图不动。
+    duplicate=True 表示两张图几乎相同；前端可隐藏后一张，避免出现细条。
+    """
+    details: Dict[str, Any] = {
+        "seams": [],
+        "confidence": [],
+        "valid": [],
+        "snapped": [],
+        "duplicate": [],
+    }
+    if len(images) < 2:
+        return details
+
+    cleaned = [
+        preprocess_for_detection(im, note_rgb, tolerance, softness) for im in images
+    ]
+    bars = [
+        detect_measure_barlines(
+            im,
+            coefficient_horizontal=coefficient_horizontal,
+            coefficient_vertical=coefficient_vertical,
+        )
+        for im in cleaned
+    ]
+    profiles = [_stitch_column_profile(im) for im in cleaned]
+    grays = [_to_gray_resized(im, max_width) for im in cleaned]
+    note_grays = [
+        _notes_only_gray(cleaned[i], bars[i], coefficient_horizontal, max_width)
+        for i in range(len(cleaned))
+    ]
+
+    for index in range(len(images) - 1):
+        gray_a, _ratio_a = grays[index]
+        gray_b, _ratio_b = grays[index + 1]
+        width_a = images[index].width
+        width_b = images[index + 1].width
+        min_width = min(width_a, width_b)
+
+        # 零位移下几乎相同：同一帧/几乎没滚动。保留前一张，后一张交给前端隐藏。
+        ncc_zero = _ncc_2d(gray_a, gray_b, 0)
+        mad_zero = _mean_abs_diff(gray_a, gray_b)
+        duplicate = ncc_zero >= DUPLICATE_NCC or mad_zero <= 3.0
+        if duplicate:
+            confidence = max(0.0, ncc_zero)
+            valid, snapped = False, False
+            seam = (1.0, 0.0)
+        else:
+            candidates = _stitch_profile_candidates(
+                profiles[index], profiles[index + 1]
+            )
+            top_corr = candidates[0][0] if candidates else 0.0
+            shift = 0
+            valid = False
+            snapped = False
+            confidence = 0.0
+            if candidates and top_corr >= MIN_STITCH_CORRELATION:
+                # 1D 剖面负责给候选；只对分数接近的候选（大多是“多一小节”的
+                # 周期歧义）用去线后的音符内容做 2D 裁决。
+                shortlist = [
+                    item for item in candidates if item[0] >= top_corr - 0.05
+                ][:12]
+                best_notes: Optional[Tuple[float, int]] = None
+                for _profile_corr, candidate_shift, _overlap in shortlist:
+                    shift_resized = int(
+                        round(
+                            candidate_shift
+                            * (note_grays[index].shape[1] / max(1, width_a))
+                        )
+                    )
+                    ncc_notes = _ncc_2d(
+                        note_grays[index], note_grays[index + 1], shift_resized
+                    )
+                    if best_notes is None or ncc_notes > best_notes[0]:
+                        best_notes = (ncc_notes, candidate_shift)
+                if best_notes is not None:
+                    shift = best_notes[1]
+                    shift_resized = int(
+                        round(shift * (gray_a.shape[1] / max(1, width_a)))
+                    )
+                    confidence = _ncc_2d(gray_a, gray_b, shift_resized)
+                    if confidence >= MIN_STITCH_NCC:
+                        valid = True
+                        seam, snapped = _snap_stitch_seam(
+                            shift,
+                            bars[index],
+                            bars[index + 1],
+                            width_a,
+                            width_b,
+                        )
+            if not valid:
+                seam = (1.0, 0.0)
+                confidence = max(0.0, confidence)
+            elif (
+                shift <= max(2, int(min_width * DUPLICATE_MAX_SHIFT_RATIO))
+                and confidence >= 0.95
+            ):
+                duplicate = True
+                valid, snapped = False, False
+                seam = (1.0, 0.0)
+        details["seams"].append([round(seam[0], 5), round(seam[1], 5)])
+        details["confidence"].append(round(float(confidence), 4))
+        details["valid"].append(bool(valid))
+        details["snapped"].append(bool(snapped))
+        details["duplicate"].append(bool(duplicate))
+    return details
+
+
 def compute_stitch_seams(
     images: List[Image.Image],
     max_width: int = 600,
@@ -1713,43 +2033,17 @@ def compute_stitch_seams(
     tolerance: float = 300.0,
     softness: float = 90.0,
 ) -> List[Tuple[float, float]]:
-    """返回相邻截图之间的拼接缝，长度 len(images)-1。
-
-    每条缝为 (right_of_left, left_of_right)，均归一化到 0..1：
-    - right_of_left：左侧截图的右裁剪边界（应落在小节线上）；
-    - left_of_right：右侧截图的左裁剪边界（应落在小节线上）。
-
-    拼接缝优先选择两张截图中共有的小节线，从而保证拼接处一定在小节线上；
-    无法检出可靠小节线对时回退到旧的盲 MSE 重叠偏移。
-    """
-    cleaned = [
-        preprocess_for_detection(im, note_rgb, tolerance, softness) for im in images
-    ]
-    # 与 /api/detect_measures 使用同一套检测（含启发式回退），保证拼接缝的小节线
-    # 一定出现在前端拿到的 measures 列表中。
-    bars = [
-        detect_measure_barlines(
-            im,
-            coefficient_horizontal=coefficient_horizontal,
-            coefficient_vertical=coefficient_vertical,
-        )
-        for im in cleaned
-    ]
-
-    seams: List[Tuple[float, float]] = []
-    for i in range(len(images) - 1):
-        seam = _best_barline_seam(
-            cleaned[i], cleaned[i + 1], bars[i], bars[i + 1], max_width
-        )
-        if seam is None:
-            ga, _ = _to_gray_resized(cleaned[i], max_width)
-            gb, _ = _to_gray_resized(cleaned[i + 1], max_width)
-            o = _best_stitch_offset(ga, gb)
-            left = _snap_to_barline(o, bars[i + 1], images[i + 1].width)
-            right = _snap_to_barline(1.0 - o, bars[i], images[i].width)
-            seam = (right, left)
-        seams.append(seam)
-    return seams
+    """兼容旧接口：只返回拼接缝列表。"""
+    details = compute_stitch_details(
+        images,
+        max_width=max_width,
+        coefficient_horizontal=coefficient_horizontal,
+        coefficient_vertical=coefficient_vertical,
+        note_rgb=note_rgb,
+        tolerance=tolerance,
+        softness=softness,
+    )
+    return [tuple(seam) for seam in details["seams"]]
 
 
 def layout_rows(

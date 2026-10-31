@@ -276,6 +276,11 @@ input {
   user-select: none;
 }
 
+/* 预览图下方的常驻时间轴：不放在「高级设置」折叠面板里。 */
+.timeline-main {
+  margin: 16px 8px 22px;
+}
+
 .timeline-track {
   position: absolute;
   left: 0;
@@ -285,6 +290,31 @@ input {
   height: 6px;
   border-radius: 3px;
   background: var(--line);
+  cursor: pointer;
+}
+
+.timeline-playhead {
+  position: absolute;
+  top: -5px;
+  bottom: -5px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--accent-strong);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.timeline-playhead::after {
+  content: "";
+  position: absolute;
+  top: -4px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid var(--accent-strong);
 }
 
 .timeline-progress {
@@ -308,6 +338,7 @@ input {
   box-shadow: 0 1px 6px rgba(0, 0, 0, 0.3);
   cursor: ew-resize;
   padding: 0;
+  z-index: 3;
 }
 
 .timeline-label {

@@ -34,7 +34,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 | `runtime_paths.py` | 打包(PyInstaller)与源码运行时的路径解析：`resource_dir()`(只读资源)/`data_dir()`(可写数据, cookie/缓存)。 |
 | `static/app.js` | 前端全部逻辑（导入、预览、裁剪、小节线、排版、上传、历史记录、更新检查、复位图标等）。 |
 | `static/icons/*.svg` | 工具栏/按钮图标，均为独立 SVG 文件，**直接改文件即可替换图形**（`loadIcons()` 读取）。 |
-| `tests/test_core.py` / `tests/test_mcp.py` | 无头回归：状态保留、刷新恢复、补插、重置/删除缓存、PDF 页数、运行中任务、同 BV 下载锁；外加官方 MCP Client 的 stdio 冒烟测试（缺 `mcp` 时自动跳过）。用 `python -m unittest discover -s tests -v` 运行，全部使用临时缓存。 |
+| `tests/test_core.py` / `tests/test_stitch.py` / `tests/test_mcp.py` | 无头回归：状态保留、刷新恢复、补插、重置/删除缓存、PDF 页数、运行中任务、同 BV 下载锁；拼接缝算法的合成图测试；官方 MCP Client 的 stdio 冒烟测试（缺 `mcp` 时自动跳过）。用 `python -m unittest discover -s tests -v` 运行，全部使用临时缓存。 |
 | `build_exe.bat` / `build_mac.sh` | 一键打包（免环境运行）。产物写入 `dist/`。 |
 | `VERSION` | 版本号，渲染进页面；更新检查用它比较。 |
 
@@ -55,7 +55,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 - `uploads/<source_id>/`：导入上传的中转副本。
 - `previews/`：预览帧 jpg 与 B 站预览视频。
 
-**`state.json` 关键字段**：`captures`(截图列表)、`images`(前端卡片状态：裁剪/隐藏/小节线)、`capture_params`、`metadata`(标题/作者/来源)、`layout`、`maxStage`、`params2`(第 2 步截图参数，见下)。PDF 额外有 `pdf_dpi`(渲染分辨率)、`page_count`(总页数)、`page_range`(`{start,end}` 页码区间)。
+**`state.json` 关键字段**：`captures`(截图列表)、`images`(前端卡片状态：裁剪/隐藏/小节线/`autoHidden`)、`capture_params`、`metadata`(标题/作者/来源)、`layout`、`maxStage`、`params2`(第 2 步截图参数，见下)。PDF 额外有 `pdf_dpi`(渲染分辨率)、`page_count`(总页数)、`page_range`(`{start,end}` 页码区间)。`images[].autoHidden` 记录自动裁剪隐藏的重复图，供“清空裁剪”只恢复这些图。
 
 ## 关键约定与“坑”（务必遵守）
 
@@ -74,7 +74,7 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
 9. **端口被占自动顺延**：启动逻辑已移到 `launcher.py`：5000 被占（macOS AirPlay / 另一个实例）时按 5001、5002… 顺延，`--port 0` 交给系统分配；`BTAB_NO_BROWSER=1` 可禁止自动开浏览器。
 10. **更新检查走后端代理**：浏览器直连 Gitee API 会 403/CORS。前端只请求同源 `GET /api/latest_version`（后端依次尝试 Gitee tags → GitHub releases）。
 11. **PDF 与图片共用卡片逻辑**：`app.IMAGE_LIKE_TYPES = {"image", "pdf"}`。凡是判断“非视频源”，**必须用 `IMAGE_LIKE_TYPES` 而不是 `== "image"`**（如 `/api/captures` 分流、`/api/source_image`）。漏掉会导致 PDF 走视频抽帧分支直接报错。前端对应的是 `state.sourceType`。
-12. **第 2 步时间轴是双单位的**：视频按「秒」、PDF 按「页」，共用同一条轨道/把手/进度条。前端用 `state.timeUnit`（`"sec"`/`"page"`）与 `isPageMode()` 切换，取值走 `currentStartTime()/currentEndTime()`，换算走 `timeToRatio()/ratioToTime()`。页模式用 `(page-1)/(total-1)` 让首尾页贴住两端。**新增第 2 步参数要同步 `STEP2_PARAM_IDS` + `collectStep2Params()` + `applyStep2Params()`**，否则改动不会持久化。
+12. **第 2 步时间轴是双单位的**：视频按「秒」、PDF 按「页」，共用同一条轨道/把手/进度条。前端用 `state.timeUnit`（`"sec"`/`"page"`）与 `isPageMode()` 切换，取值走 `currentStartTime()/currentEndTime()`，换算走 `timeToRatio()/ratioToTime()`。页模式用 `(page-1)/(total-1)` 让首尾页贴住两端。**新增第 2 步参数要同步 `STEP2_PARAM_IDS` + `collectStep2Params()` + `applyStep2Params()`**，否则改动不会持久化。时间轴**常驻在预览图下方**（不在「高级设置」折叠面板里）；`timelinePlayhead` + `seekPreview()` 允许点击/拖动轨道查看任意帧，两端把手只改范围；拖动时用 `loadPreview(time, true)` 静默刷新，不弹 loading 遮罩。
 13. **PDF 预览复用 `/api/preview`**：请求体里 `time` 对 PDF 是**页号**（1 基），后端渲染该页并缩成 jpg 返回，结构与视频预览完全一致——前端不必为 PDF 分叉预览逻辑。
 14. **PDF 渲染缓存按 DPI 失效**：`pdf/<hash>/pages/` 存整份渲染图，用 `.dpi<N>.txt` 当版本戳；改 DPI 必须整体重渲（`_pages_complete()` 逐页校验，缺页即重渲）。`cache_clear` 非 full 分支也要清 `pages/`，否则「从新开始」后仍命中旧 DPI 图。
 15. **缓存源（图片/PDF）的截图必须落 `cache/crops`**：`start_image_capture()` 的 `crops_dir` 取自 `cache_dir/crops` 并写 `state.json`；否则历史记录里该条目永远没有 `crops`、封面 404、无法恢复进度。`runs/<job_id>/crops` 只用于没有缓存目录的源。
@@ -118,6 +118,11 @@ BiliTabCapture：把**动态谱视频或乐谱文档**（哔哩哔哩视频 / �
     - 导出优先读 `GET /api/source/<id>` 的 `restore.images/layout`；`serializeLayout()` 已额外持久化 `binarize/noteColor/tolerance/softness`，让 MCP 能复现第 4 步的去色/反色。没有 restore 时才用 job captures 的默认裁剪。
     - 工具：`status` / `stop_server` / `import_bvid` / `open_tab` / `get_source` / `capture` / `get_job` / `detect_measures` / `auto_crop` / `export_score` / `history`。默认不自动打开浏览器（`open_browser=True` 才开）。
     - 依赖是**可选的** `requirements-mcp.txt`（`-r requirements.txt` + `mcp>=2.0,<3`）；不要加进核心 `requirements.txt`，也**尚未打进 exe**（MCP 入口目前走源码/venv）。
+
+23. **自动裁剪/去重**：`POST /api/stitch` 返回 `seams/confidence/valid/snapped/duplicate`（`tab_extractor.compute_stitch_details`）。
+    - 位移候选由列墨迹剖面 `_profile_correlations`（前缀和 + `np.correlate`，全分辨率向量化）给出；小节线有周期性，**必须用去掉谱表横线/竖小节线后的 2D 音符内容**（`_notes_only_gray`）在 1D 分数接近的候选间裁决。只用全图 2D NCC 会把“多一小节”的位移排到前面（实测复现）。
+    - `valid=false` 时前端保持整图；`duplicate=true` 隐藏后一张；前后两张都可靠且剩余宽度 <3% 时隐藏整张。`autoHidden` 随 state 持久化；“清空裁剪”只恢复自动隐藏的图，用户手动隐藏的保留。
+    - **不要回到“只看 seam + `r-l<0.02` 就重置整图”的旧逻辑**：那会把完全重复的帧重新显示，留下重复小节。低置信度宁可整图不动，也不要误裁。
 
 ## 常用命令
 
@@ -182,6 +187,8 @@ ps[0].save('/tmp/t.pdf', save_all=True, append_images=ps[1:])"
 - 涉及 psz：`POST /api/psz` 后把包读回来，确认条目**都在根目录** —— 多一个子目录就会在 PDF Score 那边变成两张乐谱；再对一遍四条分支：有小节线→`score.json` 带 `pages`；每行一个小节且无音频→**没有** `score.json`；每行一个小节但有音频→`score.json` 在且 `pages` 为空数组。带 `score.json` 且 `pages` 非空时，还要确认 `pages` 的张数、页面尺寸与 PDF 实际的页数、MediaBox 一致（PDF Score 会拿 PDF 的真实值覆盖它们）。
 - 涉及启动器/并发：确认无服务时能 detached 拉起、有服务时返回 `reused: true`、两个启动器并发只起一个服务；端口被占能顺延到 5001；`?source=` 页面能进第 2 步且刷新后仍能恢复；同一个 BV 并发导入只下载一次（可 mock `download_bilibili_video` 验证调用次数）。
 - 涉及 MCP：用官方 Client 走 stdio 跑 `tests/test_mcp.py`（`list_tools` + `status`）；改导出逻辑后实际调一次 `export_score`，用 PyMuPDF 校验输出 PDF 页数。
+- 涉及自动裁剪：用真实/合成滚动谱确认没有 `l>r` 的可见卡片；检查自动隐藏数量、“清空裁剪”能恢复自动隐藏；同一排版下导出页数应因去重减少。
+- 涉及第 2 步时间轴：预览图下方时间轴可见；点击/拖动轨道能查看任意帧并同步预览；拖两端只改范围且释放后预览同步到边界。
 - 涉及刷新恢复：已完成的截图刷新后能恢复卡片；运行中的任务刷新后能继续轮询并完成；重置进度保留 master/视频，删除缓存才移除原文件。
 - 涉及多实例：`--status` 能列出 `servers/` 注册表里的实例，`--stop-all` 能清理默认端口与随机端口实例，且不会误停其他副本（data_dir 不同）。
 - 涉及打包：重新执行 `build_exe.bat` / `build_mac.sh` 后，至少确认 `--bvid` 可用；未重新打包要明确说明“旧 exe 不包含该功能”。

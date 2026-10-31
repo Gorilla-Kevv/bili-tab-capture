@@ -31,7 +31,7 @@ from tab_extractor import (
     build_pdf_from_images,
     build_score_meta,
     build_video_metadata,
-    compute_stitch_seams,
+    compute_stitch_details,
     detect_measure_barlines,
     download_bilibili_video,
     extract_bilibili_id,
@@ -1780,6 +1780,8 @@ def save_state():
                     target["measures"] = patch["measures"]
                 if "hidden" in patch:
                     target["hidden"] = patch["hidden"]
+                if "autoHidden" in patch:
+                    target["autoHidden"] = bool(patch["autoHidden"])
         if payload.get("layout") is not None:
             state["layout"] = payload["layout"]
         if payload.get("maxStage") is not None:
@@ -2437,8 +2439,8 @@ def stitch_offsets():
             if not src.exists():
                 continue
             images.append(Image.open(src).convert("RGB"))
-        seams = (
-            compute_stitch_seams(
+        details = (
+            compute_stitch_details(
                 images,
                 max_width=max_width,
                 coefficient_horizontal=coefficient_horizontal,
@@ -2448,13 +2450,15 @@ def stitch_offsets():
                 softness=softness,
             )
             if len(images) >= 2
-            else []
+            else {
+                "seams": [],
+                "confidence": [],
+                "valid": [],
+                "snapped": [],
+                "duplicate": [],
+            }
         )
-        return jsonify({
-            "seams": [
-                [round(s[0], 5), round(s[1], 5)] for s in seams
-            ]
-        })
+        return jsonify(details)
     except Exception as exc:
         return json_error(str(exc), 500)
 

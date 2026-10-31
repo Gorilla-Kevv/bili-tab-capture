@@ -20,6 +20,7 @@ const state = {
   initialPreviewTime: null,
   pendingPreviewTime: null,
   pendingPreviewSourceId: null,
+  pendingPreviewQuiet: false,
   loginPollTimer: null,
   bilibiliLoggedIn: false,
   stage: 1,
@@ -68,6 +69,7 @@ const els = {
   timeline: document.getElementById("timeline"),
   timelineTrack: document.getElementById("timelineTrack"),
   timelineProgress: document.getElementById("timelineProgress"),
+  timelinePlayhead: document.getElementById("timelinePlayhead"),
   timelineStartHandle: document.getElementById("timelineStartHandle"),
   timelineEndHandle: document.getElementById("timelineEndHandle"),
   timelineEndLabel: document.getElementById("timelineEndLabel"),
@@ -405,6 +407,7 @@ function serializeImages() {
     w: m.w,
     h: m.h,
     hidden: !!m.hidden,
+    autoHidden: !!m.autoHidden,
     crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
     measures: m.measures || [],
   }));
@@ -438,6 +441,7 @@ function serializeLayout() {
 function imageSignature(m) {
   return JSON.stringify({
     hidden: !!m.hidden,
+    autoHidden: !!m.autoHidden,
     crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
     measures: m.measures || [],
   });
@@ -472,6 +476,7 @@ function persistStateNow() {
         patches.push({
           file: m.file,
           hidden: !!m.hidden,
+          autoHidden: !!m.autoHidden,
           crop: { l: m.crop.l, r: m.crop.r, t: m.crop.t ?? 0, b: m.crop.b ?? 1 },
           measures: m.measures || [],
         });
@@ -746,9 +751,49 @@ function ratioToTime(ratio) {
   return clamp(ratio * total, 0, total);
 }
 
+function currentPreviewTime() {
+  if (Number.isFinite(state.previewTime)) return state.previewTime;
+  if (Number.isFinite(state.initialPreviewTime)) return state.initialPreviewTime;
+  return isPageMode() ? 1 : currentStartTime();
+}
+
+function updateTimelinePlayhead(value) {
+  if (!els.timelinePlayhead) return;
+  if (!hasTimelineDuration()) {
+    els.timelinePlayhead.style.display = "none";
+    return;
+  }
+  const total = timelineTotal();
+  let time = Number(value);
+  if (!Number.isFinite(time)) time = isPageMode() ? 1 : 0;
+  time = isPageMode()
+    ? clamp(Math.round(time), 1, total)
+    : clamp(time, 0, total);
+  els.timelinePlayhead.style.display = "";
+  els.timelinePlayhead.style.left = `${timeToRatio(time) * 100}%`;
+  els.timelinePlayhead.setAttribute("aria-valuetext", timelineLabel(time));
+}
+
+// 预览任意帧：立即移动播放头/时间提示，画面由 loadPreview 异步刷新（只保留最新目标）。
+function seekPreview(value) {
+  if (!hasTimelineDuration()) return;
+  const total = timelineTotal();
+  let time = Number(value);
+  if (!Number.isFinite(time)) return;
+  time = isPageMode()
+    ? clamp(Math.round(time), 1, total)
+    : clamp(time, 0, total);
+  state.previewTime = time;
+  state.previewRequestId += 1; // 让在途的旧帧结果失效
+  updateTimelinePlayhead(time);
+  updatePreviewTimeHint();
+  loadPreview(time, true);
+}
+
 function updateTimeline() {
   if (!hasTimelineDuration()) {
     els.timeline.classList.add("is-disabled");
+    if (els.timelinePlayhead) els.timelinePlayhead.style.display = "none";
     return;
   }
   els.timeline.classList.remove("is-disabled");
@@ -760,6 +805,7 @@ function updateTimeline() {
   els.timelineEndHandle.style.left = `${endPct}%`;
   els.timelineProgress.style.left = `${startPct}%`;
   els.timelineProgress.style.width = `${Math.max(0, endPct - startPct)}%`;
+  updateTimelinePlayhead(currentPreviewTime());
 }
 
 function timelineRatioFromEvent(event) {
@@ -781,17 +827,24 @@ function beginTimelineDrag(which, event) {
 function applyTimelineDrag(ratio) {
   const total = timelineTotal();
   const value = ratioToTime(ratio);
+  if (state.timelineDrag === "playhead") {
+    seekPreview(value);
+    return;
+  }
   const gap = timelineMinGap();
   if (state.timelineDrag === "start") {
     const maxStart = isPageMode()
       ? Math.max(1, resolvedEndTime() - gap)
       : Math.max(0, resolvedEndTime() - gap);
     setRangeInputs("start", clamp(value, isPageMode() ? 1 : 0, maxStart));
+    updateTimeline();
+    seekPreview(currentStartTime());
   } else {
     const minEnd = Math.min(total, currentStartTime() + gap);
     setRangeInputs("end", clamp(value, minEnd, total));
+    updateTimeline();
+    seekPreview(resolvedEndTime());
   }
-  updateTimeline();
 }
 
 function dragTimeline(event) {
@@ -803,11 +856,8 @@ function beginTimelineTrackDrag(event) {
   if (!hasTimelineDuration()) return;
   if (event.target.closest(".timeline-handle")) return;
   event.preventDefault();
-  const ratio = timelineRatioFromEvent(event);
-  const startRatio = timeToRatio(currentStartTime());
-  const endRatio = timeToRatio(resolvedEndTime());
-  state.timelineDrag = Math.abs(ratio - startRatio) <= Math.abs(ratio - endRatio) ? "start" : "end";
-  applyTimelineDrag(ratio);
+  state.timelineDrag = "playhead";
+  seekPreview(ratioToTime(timelineRatioFromEvent(event)));
   els.timeline.setPointerCapture?.(event.pointerId);
 }
 
@@ -815,11 +865,13 @@ function endTimelineDrag() {
   if (!state.timelineDrag) return;
   const which = state.timelineDrag;
   state.timelineDrag = null;
-  if (which === "start") {
-    loadPreview(currentStartTime());
-  } else {
-    loadPreview(resolvedEndTime());
-  }
+  const target =
+    which === "playhead"
+      ? state.previewTime
+      : which === "start"
+        ? currentStartTime()
+        : resolvedEndTime();
+  if (Number.isFinite(target)) seekPreview(target);
 }
 
 function resetExtractionState() {
@@ -876,6 +928,7 @@ function applySource(source, mode /* '' | 'restore' | 'fresh' */) {
   state.previewTime = null;
   state.pendingPreviewTime = null;
   state.pendingPreviewSourceId = null;
+  state.pendingPreviewQuiet = false;
   clearPreviewStatus();
   updatePreviewTimeHint();
   resetExtractionState();
@@ -1137,7 +1190,7 @@ async function clearPendingCache() {
 }
 
 
-async function loadPreview(timeValue) {
+async function loadPreview(timeValue, quiet = false) {
   if (!state.sourceId) return;
 
   if (state.sourceType === "image") {
@@ -1158,6 +1211,7 @@ async function loadPreview(timeValue) {
   if (state.previewLoading) {
     state.pendingPreviewTime = time;
     state.pendingPreviewSourceId = sourceId;
+    state.pendingPreviewQuiet = quiet;
     state.previewRequestId += 1;
     els.previewStatus.textContent = "更新预览中...";
     return;
@@ -1165,7 +1219,12 @@ async function loadPreview(timeValue) {
 
   const requestId = state.previewRequestId + 1;
   state.previewRequestId = requestId;
-  setPreviewLoading(true, "更新预览中...");
+  if (quiet) {
+    // 拖动播放头/范围时不弹 loading 遮罩，避免画面闪烁；仍占用请求锁。
+    state.previewLoading = true;
+  } else {
+    setPreviewLoading(true, "更新预览中...");
+  }
 
   try {
     const data = await fetchJson("/api/preview", {
@@ -1178,6 +1237,7 @@ async function loadPreview(timeValue) {
     setPreviewQnBadge((data && (data.quality || "").toString()) || null);
     state.previewTime = time;
     updatePreviewTimeHint();
+    updateTimelinePlayhead(time);
     clearPreviewStatus();
   } catch (error) {
     if (requestId !== state.previewRequestId || sourceId !== state.sourceId) return;
@@ -1186,10 +1246,12 @@ async function loadPreview(timeValue) {
     if (sourceId !== state.sourceId) return;
     if (state.pendingPreviewTime !== null && state.pendingPreviewSourceId === state.sourceId) {
       const nextTime = state.pendingPreviewTime;
+      const nextQuiet = state.pendingPreviewQuiet;
       state.pendingPreviewTime = null;
       state.pendingPreviewSourceId = null;
+      state.pendingPreviewQuiet = false;
       state.previewLoading = false;
-      loadPreview(nextTime);
+      loadPreview(nextTime, nextQuiet);
     } else if (requestId === state.previewRequestId) {
       state.previewLoading = false;
     }
@@ -1528,6 +1590,7 @@ function restoreCards(images) {
     w: m.w,
     h: m.h,
     hidden: !!m.hidden,
+    autoHidden: !!m.autoHidden,
     flash: false,
     crop: { l: m.crop?.l ?? 0, r: m.crop?.r ?? 1, t: m.crop?.t ?? 0, b: m.crop?.b ?? 1 },
     measures: m.measures || [],
@@ -1688,9 +1751,11 @@ function syncSplitButtons() {
   });
 }
 
-// 是否已有自动裁剪结果（存在非默认的水平裁剪框）。
+// 是否已有自动裁剪结果（非默认水平裁剪，或自动隐藏了重复截图）。
 function hasAutoCrop() {
-  return state.images.some((m) => m.crop.l > 0.001 || m.crop.r < 0.999);
+  return state.images.some(
+    (m) => m.autoHidden || m.crop.l > 0.001 || m.crop.r < 0.999
+  );
 }
 
 // 是否已标记小节线。
@@ -1730,9 +1795,10 @@ function detectParams() {
 }
 
 // 自动裁剪：去除相邻截图之间重复的小节（把拼接缝对齐到小节线上）。
+// 低置信度的缝不裁剪；几乎相同的帧只保留前一张；完全被前后截图覆盖的帧自动隐藏。
 async function autoCrop() {
   const files = state.images.map((m) => m.file);
-  if (!files.length) return;
+  if (!files.length) return { hidden: 0 };
   const data = await fetchJson("/api/stitch", {
     method: "POST",
     headers: JSON_HEADERS,
@@ -1745,22 +1811,66 @@ async function autoCrop() {
   });
 
   const seams = data.seams || [];
-  state.images.forEach((m, i) => {
-    if (i > 0) {
-      const s = seams[i - 1];
-      if (s && typeof s[1] === "number") m.crop.l = clamp(s[1], 0, 1);
+  const valid = data.valid || [];
+  const duplicate = data.duplicate || [];
+  const images = state.images;
+  const n = images.length;
+
+  // 清掉上一轮自动裁剪/自动隐藏；用户手动隐藏的图片保持隐藏。
+  images.forEach((m) => {
+    if (m.autoHidden) {
+      m.hidden = false;
+      m.autoHidden = false;
     }
-    if (i < state.images.length - 1) {
-      const s = seams[i];
-      if (s && typeof s[0] === "number") m.crop.r = clamp(s[0], 0, 1);
+    m.crop.l = 0;
+    m.crop.r = 1;
+  });
+
+  // 几乎相同的相邻帧：保留前一张，隐藏后一张（避免留下细条）。
+  for (let i = 0; i < n - 1; i += 1) {
+    if (!duplicate[i]) continue;
+    const m = images[i + 1];
+    if (!m.hidden) {
+      m.hidden = true;
+      m.autoHidden = true;
     }
-    if (m.crop.r - m.crop.l < 0.02) {
+    m.crop.l = 0;
+    m.crop.r = 1;
+  }
+
+  // 只有置信度足够的缝才应用；低置信度保持整图，避免误裁。
+  for (let i = 0; i < n - 1; i += 1) {
+    if (!valid[i] || duplicate[i]) continue;
+    const s = seams[i];
+    if (!s) continue;
+    if (typeof s[0] === "number") images[i].crop.r = clamp(s[0], 0, 1);
+    if (typeof s[1] === "number") images[i + 1].crop.l = clamp(s[1], 0, 1);
+  }
+
+  // 前后两张都可靠且没有剩余内容：整张隐藏，不再保留重复小节。
+  for (let i = 1; i < n - 1; i += 1) {
+    const m = images[i];
+    if (m.hidden || m.autoHidden) continue;
+    const prevValid = valid[i - 1] && !duplicate[i - 1];
+    const nextValid = valid[i] && !duplicate[i];
+    if (prevValid && nextValid && m.crop.r - m.crop.l < 0.03) {
+      m.hidden = true;
+      m.autoHidden = true;
+      m.crop.l = 0;
+      m.crop.r = 1;
+    }
+  }
+
+  // 可见的图不能留空/反向裁剪。
+  images.forEach((m) => {
+    if (!m.autoHidden && m.crop.r - m.crop.l < 0.02) {
       m.crop.l = 0;
       m.crop.r = 1;
     }
   });
 
   syncCardList();
+  return { hidden: images.filter((m) => m.autoHidden).length };
 }
 
 // 自动小节：标记每张截图里的小节线（标记后排版可放大图片）。
@@ -3447,21 +3557,40 @@ els.generateButton.addEventListener("click", generateCaptures);
 els.toLayoutButton.addEventListener("click", () => setStage(4));
 els.autoCropButton.addEventListener("click", async () => {
   if (hasAutoCrop()) {
-    // 清空裁剪：恢复整图（不包含手动设置的垂直裁剪）。
+    // 清空裁剪：恢复整图（保留手动设置的垂直裁剪和手动隐藏的图片）。
+    let restored = 0;
     state.images.forEach((m) => {
       m.crop.l = 0;
       m.crop.r = 1;
+      if (m.autoHidden) {
+        m.hidden = false;
+        m.autoHidden = false;
+        restored += 1;
+      }
     });
     syncCardList();
-    showToast("已清空自动裁剪。");
+    showToast(
+      restored
+        ? `已清空自动裁剪，并恢复 ${restored} 张自动隐藏的截图。`
+        : "已清空自动裁剪。"
+    );
     return;
   }
   const pending = showToast("正在自动裁剪…", "", { persist: true });
+  els.autoCropButton.disabled = true;
   try {
-    await autoCrop();
-    pending.resolve("已自动裁剪。", "success");
+    const result = await autoCrop();
+    const hidden = result && result.hidden ? result.hidden : 0;
+    pending.resolve(
+      hidden
+        ? `已自动裁剪，自动隐藏 ${hidden} 张重复截图（导出时会跳过）。`
+        : "已自动裁剪。",
+      "success"
+    );
   } catch (e) {
     pending.resolve(e.message || "自动裁剪失败。", "error");
+  } finally {
+    els.autoCropButton.disabled = false;
   }
 });
 els.autoMeasureButton.addEventListener("click", async () => {
@@ -3475,11 +3604,14 @@ els.autoMeasureButton.addEventListener("click", async () => {
     return;
   }
   const pending = showToast("正在识别小节线…", "", { persist: true });
+  els.autoMeasureButton.disabled = true;
   try {
     await autoMeasures();
     pending.resolve("已自动识别小节线。", "success");
   } catch (e) {
     pending.resolve(e.message || "自动识别小节线失败。", "error");
+  } finally {
+    els.autoMeasureButton.disabled = false;
   }
 });
 els.downloadPdfButton.addEventListener("click", downloadPdf);
